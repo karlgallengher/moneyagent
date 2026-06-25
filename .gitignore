@@ -1,0 +1,24 @@
+# Secrets
+api
+spark_api
+.env
+.env.*
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated outputs and debug logs
+processed/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
