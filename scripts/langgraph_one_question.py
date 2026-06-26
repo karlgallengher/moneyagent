@@ -16,19 +16,19 @@ import requests
 from langgraph.graph import END, StateGraph
 
 
-TARGET_QID = "res_a_003" 
+TARGET_QID = "ins_a_006" 
 # QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_reports_questions.json"
 # PAGE_INDEX_PATH = "processed/page_index_financial_reports/page_index.jsonl"
 
 # QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_contracts_questions.json"
 # PAGE_INDEX_PATH = "processed/page_index_financial_contracts/page_index.jsonl"
 
-QUESTIONS_PATH = "public_dataset_upload/questions/group_a/research_questions.json"
-PAGE_INDEX_PATH = "processed/page_index_research/page_index.jsonl"
+QUESTIONS_PATH = "public_dataset_upload/questions/group_a/insurance_questions.json"
+PAGE_INDEX_PATH = "processed/page_index_insurance/page_index.jsonl"
 
 
 
-ANSWER_CSV = "processed/submission/research_answer.csv"
+ANSWER_CSV = "processed/submission/insurance_answer.csv"
 OUTPUT_DIR = "processed/agent_debug"
 
 INITIAL_TOP_K = 4
@@ -47,7 +47,7 @@ SECTION_CONTEXT_MIN_CHARS = 20
 MAX_TOC_ROUTE_DEPTH = 4
 MAX_TOC_CHILDREN = 24
 SAVE_DEBUG_OUTPUTS = True
-APPEND_ANSWER_CSV =False
+APPEND_ANSWER_CSV =True
 DRY_RUN_WITHOUT_LLM = False
 # DASHSCOPE_API_KEY_ENV = "DASHSCOPE_API_KEY"
 # DASHSCOPE_API_KEY_FILE = "api"
@@ -1502,7 +1502,7 @@ def finalize_node(state: AgentState) -> AgentState:
     true_options = [key for key in option_order if option_verdict(state, key) is True]
     answer_format = state["question"].get("answer_format")
     question_type = state["question"].get("type")
-    if use_task_reasoning_path(state["question"]):
+    if state.get("task_reasoning_debug"):
         state["status"] = "done"
         add_trace(state, f"finalize format={answer_format} type={question_type} answer={state['final_answer']}")
         return state

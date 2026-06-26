@@ -9,9 +9,9 @@ from typing import Iterable
 
 
 # Edit this config, then click VSCode's "Run Python File" button.
-# DEFAULT_INPUT can be a single .md file or a directory.
-DEFAULT_INPUT = "public_dataset_upload/raw_md/research"
-DEFAULT_OUTPUT = "processed/page_index_research"
+# DEFAULT_INPUT can be a single file or a directory.
+DEFAULT_INPUT = "public_dataset_upload/raw_md/regulatory"
+DEFAULT_OUTPUT = "processed/page_index_regulatory"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_OVERLAP_CHARS = 160
 DEFAULT_LIMIT = 0
@@ -20,6 +20,9 @@ DEFAULT_SPLIT_MODE = "heading"  # "heading", "heading_plus_numbered", or "block"
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+LEGAL_CHAPTER_RE = re.compile(r"^\s*(第[一二三四五六七八九十百千0-9]+章)\s*(.+?)?\s*$")
+LEGAL_SECTION_RE = re.compile(r"^\s*(第[一二三四五六七八九十百千0-9]+节)\s*(.+?)?\s*$")
+LEGAL_ARTICLE_RE = re.compile(r"^\s*(第[一二三四五六七八九十百千0-9]+条(?:之[一二三四五六七八九十百千0-9]+)?)\s*(.*)$")
 NUMBERED_HEADING_RE = re.compile(
     r"^\s*(?:"
     r"\d+(?:\.\d+)+[\.、]?\s+\S+|"
@@ -295,6 +298,112 @@ def parse_markdown_by_heading_and_numbered(text: str, fix_mojibake: bool) -> tup
     return toc, blocks
 
 
+def parse_regulatory_txt(text: str, fix_mojibake: bool) -> tuple[list[dict], list[Block]]:
+    text = normalize_text(text, fix_mojibake=fix_mojibake)
+    lines = text.splitlines()
+    offset = 0
+    heading_stack: list[tuple[int, str]] = []
+    numbered_stack: list[tuple[int, str]] = []
+    toc: list[dict] = []
+    blocks: list[Block] = []
+    buf: list[str] = []
+    buf_start = 0
+    buf_heading_path: list[str] = []
+    buf_level = 0
+
+    def full_path() -> list[str]:
+        return current_path(heading_stack) + current_path(numbered_stack)
+
+    def flush(end_pos: int) -> None:
+        nonlocal buf, buf_start, buf_heading_path, buf_level
+        raw = "\n".join(buf).strip()
+        if raw:
+            blocks.append(
+                Block(
+                    kind="section",
+                    text=raw,
+                    char_start=buf_start,
+                    char_end=end_pos,
+                    heading_path=buf_heading_path,
+                    level=buf_level,
+                )
+            )
+        buf = []
+        buf_heading_path = []
+        buf_level = 0
+
+    def push_heading(level: int, title: str, line_start: int) -> None:
+        nonlocal buf_start, buf_heading_path, buf_level
+        flush(line_start)
+        while heading_stack and heading_stack[-1][0] >= level:
+            heading_stack.pop()
+        heading_stack.append((level, title))
+        numbered_stack.clear()
+        path = full_path()
+        toc.append({"level": level, "title": title, "heading_path": path})
+        buf_start = line_start
+        buf_heading_path = path
+        buf_level = level
+
+    for line in lines:
+        line_start = offset
+        line_end = offset + len(line)
+        offset = line_end + 1
+
+        stripped = line.strip()
+        if not stripped:
+            if not buf and heading_stack:
+                buf_start = line_start
+                buf_heading_path = full_path()
+                buf_level = heading_stack[-1][0] + (numbered_stack[-1][0] if numbered_stack else 0)
+            buf.append(line)
+            continue
+
+        chapter_match = LEGAL_CHAPTER_RE.match(line)
+        if chapter_match and chapter_match.group(1):
+            title = stripped
+            push_heading(1, title, line_start)
+            continue
+
+        section_match = LEGAL_SECTION_RE.match(line)
+        if section_match and section_match.group(1):
+            title = stripped
+            push_heading(2, title, line_start)
+            continue
+
+        article_match = LEGAL_ARTICLE_RE.match(line)
+        if article_match and article_match.group(1):
+            title = stripped
+            push_heading(3, title, line_start)
+            continue
+
+        numbered_match = NUMBERED_MARKER_RE.match(line)
+        if numbered_match and heading_stack:
+            flush(line_start)
+            title = stripped
+            numbered_level = numbered_marker_level(numbered_match.group("marker"), numbered_stack)
+            while numbered_stack and numbered_stack[-1][0] >= numbered_level:
+                numbered_stack.pop()
+            numbered_stack.append((numbered_level, title))
+            path = full_path()
+            level = heading_stack[-1][0] + numbered_level
+            toc.append({"level": level, "title": title, "heading_path": path})
+            buf_start = line_start
+            buf_heading_path = path
+            buf_level = level
+            buf.append(line)
+            continue
+
+        if not buf and heading_stack:
+            buf_start = line_start
+            buf_heading_path = full_path()
+            buf_level = heading_stack[-1][0] + (numbered_stack[-1][0] if numbered_stack else 0)
+        buf.append(line)
+
+    flush(len(text))
+    return toc, blocks
+
+
 def parse_markdown_by_block(text: str, fix_mojibake: bool) -> tuple[list[dict], list[Block]]:
     text = normalize_text(text, fix_mojibake=fix_mojibake)
     lines = text.splitlines()
@@ -410,16 +519,30 @@ def infer_domain(path: Path, root: Path) -> str:
     except ValueError:
         rel = path
     parts = rel.parts
-    if "raw_md" in parts:
-        idx = parts.index("raw_md")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
+    for marker in ("raw_md", "raw"):
+        if marker in parts:
+            idx = parts.index(marker)
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
     abs_parts = path.parts
-    if "raw_md" in abs_parts:
-        idx = abs_parts.index("raw_md")
-        if idx + 1 < len(abs_parts):
-            return abs_parts[idx + 1]
+    for marker in ("raw_md", "raw"):
+        if marker in abs_parts:
+            idx = abs_parts.index(marker)
+            if idx + 1 < len(abs_parts):
+                return abs_parts[idx + 1]
     return parts[0] if len(parts) > 1 else "unknown"
+
+
+def infer_title(path: Path, toc: list[dict]) -> str:
+    stem = path.stem
+    match = re.match(r"^strict_v\d+_\d+_(.+)$", stem)
+    if match:
+        return match.group(1).strip()
+    if toc:
+        first = maybe_fix_mojibake(str(toc[0].get("title") or "")).strip()
+        if first:
+            return first
+    return stem
 
 
 def build_pages(
@@ -432,7 +555,9 @@ def build_pages(
 ) -> tuple[dict, dict, list[dict]]:
     raw_text = path.read_text(encoding="utf-8", errors="ignore")
     text = normalize_text(raw_text, fix_mojibake=fix_mojibake)
-    if split_mode == "heading":
+    if path.suffix.lower() == ".txt":
+        toc, blocks = parse_regulatory_txt(raw_text, fix_mojibake=fix_mojibake)
+    elif split_mode == "heading":
         toc, blocks = parse_markdown_by_heading(raw_text, fix_mojibake=fix_mojibake)
     elif split_mode == "heading_plus_numbered":
         toc, blocks = parse_markdown_by_heading_and_numbered(raw_text, fix_mojibake=fix_mojibake)
@@ -441,12 +566,15 @@ def build_pages(
 
     doc_id = infer_doc_id(path)
     domain = infer_domain(path, root)
-    title = toc[0]["title"] if toc else path.stem
+    title = infer_title(path, toc)
     pages: list[dict] = []
     page_no = 1
 
     for block in blocks:
-        parts = [block.text] if split_mode == "heading" else split_long_text(block.text, max_chars, overlap_chars)
+        if path.suffix.lower() == ".txt":
+            parts = split_long_text(block.text, max_chars, overlap_chars)
+        else:
+            parts = [block.text] if split_mode == "heading" else split_long_text(block.text, max_chars, overlap_chars)
         for part_idx, part in enumerate(parts):
             terms = extract_terms(part)
             heading_text = " ".join(block.heading_path)
@@ -497,11 +625,20 @@ def build_pages(
     return doc, toc_doc, pages
 
 
-def iter_markdown_files(input_path: Path) -> Iterable[Path]:
+def iter_input_files(input_path: Path) -> Iterable[Path]:
     if input_path.is_file():
         yield input_path
     else:
-        yield from sorted(input_path.rglob("*.md"))
+        if input_path.name.lower() == "regulatory":
+            attachments_dir = input_path / "attachments"
+            if attachments_dir.exists():
+                yield from sorted(attachments_dir.rglob("*.md"))
+            raw_txt_dir = input_path.parent.parent / "raw" / "regulatory" / "txt"
+            if raw_txt_dir.exists():
+                yield from sorted(raw_txt_dir.rglob("*.txt"))
+            return
+        for suffix in ("*.md", "*.txt"):
+            yield from sorted(input_path.rglob(suffix))
 
 
 def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -668,7 +805,7 @@ def write_page_preview(path: Path, pages: Iterable[dict]) -> None:
 def main() -> None:
     input_path = Path(DEFAULT_INPUT).resolve()
     output_dir = Path(DEFAULT_OUTPUT).resolve()
-    files = list(iter_markdown_files(input_path))
+    files = list(dict.fromkeys(iter_input_files(input_path)))
     if DEFAULT_LIMIT:
         files = files[:DEFAULT_LIMIT]
 
