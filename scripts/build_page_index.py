@@ -10,8 +10,8 @@ from typing import Iterable
 
 # Edit this config, then click VSCode's "Run Python File" button.
 # DEFAULT_INPUT can be a single file or a directory.
-DEFAULT_INPUT = "public_dataset_upload/raw_md/regulatory"
-DEFAULT_OUTPUT = "processed/page_index_regulatory"
+DEFAULT_INPUT = "public_dataset_upload/raw_md/financial_reports"
+DEFAULT_OUTPUT = "processed/page_index_financial_reports"
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_OVERLAP_CHARS = 160
 DEFAULT_LIMIT = 0

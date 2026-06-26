@@ -16,19 +16,19 @@ import requests
 from langgraph.graph import END, StateGraph
 
 
-TARGET_QID = "ins_a_006" 
+TARGET_QID = "fin_a_002" 
 # QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_reports_questions.json"
 # PAGE_INDEX_PATH = "processed/page_index_financial_reports/page_index.jsonl"
 
 # QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_contracts_questions.json"
 # PAGE_INDEX_PATH = "processed/page_index_financial_contracts/page_index.jsonl"
 
-QUESTIONS_PATH = "public_dataset_upload/questions/group_a/insurance_questions.json"
-PAGE_INDEX_PATH = "processed/page_index_insurance/page_index.jsonl"
+QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_reports_questions.json"
+PAGE_INDEX_PATH = "processed/page_index_financial_reports/page_index.jsonl"
 
 
 
-ANSWER_CSV = "processed/submission/insurance_answer.csv"
+ANSWER_CSV = "processed/submission/financial_reports_answer.csv"
 OUTPUT_DIR = "processed/agent_debug"
 
 INITIAL_TOP_K = 4
@@ -47,7 +47,7 @@ SECTION_CONTEXT_MIN_CHARS = 20
 MAX_TOC_ROUTE_DEPTH = 4
 MAX_TOC_CHILDREN = 24
 SAVE_DEBUG_OUTPUTS = True
-APPEND_ANSWER_CSV =True
+APPEND_ANSWER_CSV =False
 DRY_RUN_WITHOUT_LLM = False
 # DASHSCOPE_API_KEY_ENV = "DASHSCOPE_API_KEY"
 # DASHSCOPE_API_KEY_FILE = "api"
