@@ -1,6 +1,7 @@
 # Secrets
 api
 spark_api
+api_ds
 .env
 .env.*
 
@@ -15,6 +16,8 @@ __pycache__/
 
 # Generated outputs and debug logs
 processed/
+enterprise_qa_agent/outputs/
+enterprise_qa_agent/data/atomic_questions/
 *.log
 
 # OS / editor
