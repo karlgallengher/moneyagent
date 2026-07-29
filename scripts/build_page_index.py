@@ -61,9 +61,12 @@ def maybe_fix_mojibake(text: str) -> str:
     try:
         fixed = text.encode("gb18030").decode("utf-8")
     except UnicodeError:
-        return text
-    common = ("\u7684", "\u7b2c", "\u516c\u53f8", "\u53d1\u884c", "\u503a\u5238", "\u4fe1\u606f", "\u62a5\u544a")
-    mojibake = tuple(chr(code) for code in (0x951B, 0x7ED7, 0x93C9, 0x95B2, 0x9429, 0x7039, 0x5F42, 0x20AC))
+        try:
+            fixed = text.encode("gb18030", errors="ignore").decode("utf-8", errors="ignore")
+        except UnicodeError:
+            return text
+    common = ("\u7684", "\u7b2c", "\u516c\u53f8", "\u53d1\u884c", "\u503a\u5238", "\u4fe1\u606f", "\u62a5\u544a", "\u4fdd\u9669", "\u5e74\u5ea6", "\u52df\u96c6")
+    mojibake = tuple(chr(code) for code in (0x951B, 0x7ED7, 0x93C9, 0x95B2, 0x9429, 0x7039, 0x5F42, 0x20AC, 0xFFFD))
     fixed_score = sum(fixed.count(word) for word in common) * 3 - sum(fixed.count(word) for word in mojibake)
     text_score = sum(text.count(word) for word in common) * 3 - sum(text.count(word) for word in mojibake)
     return fixed if fixed_score > text_score else text
@@ -653,6 +656,77 @@ def shorten(text: str, limit: int = 220) -> str:
     return one_line if len(one_line) <= limit else one_line[:limit] + "..."
 
 
+def unique_compact(items: Iterable[str], limit: int = 20) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = re.sub(r"\s+", " ", maybe_fix_mojibake(str(item or ""))).strip(" \t\r\n,，。；;：:")
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def extract_doc_aliases(title: str, source_path: str, toc: list[dict], first_page_text: str) -> list[str]:
+    title_fixed = maybe_fix_mojibake(title)
+    source_stem = Path(source_path).stem
+    heading_titles = [str(item.get("title") or "") for item in toc[:30]]
+    joined = "\n".join([title_fixed, source_stem, *heading_titles, first_page_text[:1800]])
+
+    candidates: list[str] = [title_fixed, source_stem]
+    candidates.extend(re.findall(r"《([^》]{3,120})》", joined))
+    candidates.extend(
+        re.findall(
+            r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,80}(?:股份有限公司|集团有限公司|有限责任公司|有限公司|公司|银行|证券|保险|基金|集团)",
+            joined,
+        )
+    )
+    candidates.extend(heading_titles[:12])
+    return unique_compact(candidates, limit=24)
+
+
+def build_doc_catalog(documents: Iterable[dict], toc_docs: Iterable[dict], pages: Iterable[dict]) -> list[dict]:
+    toc_by_doc = {doc["doc_id"]: doc for doc in toc_docs}
+    first_page_by_doc: dict[str, dict] = {}
+    for page in pages:
+        first_page_by_doc.setdefault(page["doc_id"], page)
+
+    catalog: list[dict] = []
+    for doc in documents:
+        doc_id = doc["doc_id"]
+        toc_doc = toc_by_doc.get(doc_id, {})
+        toc = toc_doc.get("toc") or []
+        first_page = first_page_by_doc.get(doc_id, {})
+        first_text = maybe_fix_mojibake(str(first_page.get("text") or ""))
+        top_headings = unique_compact(
+            (
+                item.get("title", "")
+                for item in toc
+                if int(item.get("level") or 1) <= 2
+            ),
+            limit=60,
+        )
+        title = str(doc.get("title") or toc_doc.get("title") or doc_id)
+        catalog.append(
+            {
+                "doc_id": doc_id,
+                "domain": doc.get("domain") or toc_doc.get("domain") or "",
+                "title": title,
+                "title_fixed": maybe_fix_mojibake(title),
+                "source_path": doc.get("source_path") or toc_doc.get("source_path") or "",
+                "page_count": doc.get("page_count", 0),
+                "aliases": extract_doc_aliases(title, doc.get("source_path") or "", toc, first_text),
+                "top_headings": top_headings,
+                "first_page_id": first_page.get("page_id", ""),
+                "first_page_preview": shorten(first_text, 500),
+            }
+        )
+    return catalog
+
+
 def write_toc_tree(path: Path, toc_docs: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
@@ -829,6 +903,7 @@ def main() -> None:
     write_jsonl(output_dir / "documents.jsonl", documents)
     write_jsonl(output_dir / "toc.jsonl", tocs)
     write_jsonl(output_dir / "page_index.jsonl", pages)
+    write_jsonl(output_dir / "doc_catalog.jsonl", build_doc_catalog(documents, tocs, pages))
     tree_docs = build_tree_docs(tocs, pages)
     write_jsonl(output_dir / "tree_doc.jsonl", tree_docs)
     write_doc_files(output_dir, tree_docs, pages)

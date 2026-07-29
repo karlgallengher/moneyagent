@@ -1,47 +1,167 @@
 ﻿from __future__ import annotations
 
-import csv
 import hashlib
 import json
-import math
 import os
 import re
-import time
-from collections import Counter, defaultdict
-from html import unescape
-from html.parser import HTMLParser
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, TypedDict
 
-import requests
-from langgraph.graph import END, StateGraph
+from enterprise_qa_agent.src.routing.atomic_adapter import (
+    atomic_to_legacy_question,
+    select_atomic_record,
+)
+from enterprise_qa_agent.src.routing.doc_routing import (
+    configure_doc_routing,
+    deterministic_doc_hints,
+    doc_aliases,
+    doc_hint_scores,
+    doc_profile_lines,
+    doc_profile_text,
+    doc_reroute_scores,
+    has_doc_reroute_candidate,
+    reroute_docs_for_missing_slot,
+)
+from enterprise_qa_agent.src.io.formatters import (
+    compact_html_text,
+    format_evidence,
+    format_evidence_notes,
+    format_memory_slots,
+    print_evidence_preview,
+)
+from enterprise_qa_agent.src.graph.graph_builder import build_enterprise_graph
+from enterprise_qa_agent.src.io.io_utils import load_json, load_jsonl, load_records
+from enterprise_qa_agent.src.runtime.llm_client import DRY_RUN_WITHOUT_LLM, VERBOSE_CONSOLE, call_qwen_json, dry_json
+from enterprise_qa_agent.src.io.output_utils import (
+    upsert_answer_csv,
+    write_enterprise_result,
+    write_outputs,
+)
+from enterprise_qa_agent.src.prompts.option_prompts import (
+    build_audit_prompt_text,
+    build_doc_router_prompt_text,
+    build_evidence_read_prompt_text,
+    build_evidence_extract_prompt_text,
+    build_judge_prompt_text,
+    build_slot_planner_prompt_text,
+    build_toc_repair_prompt_text,
+)
+from enterprise_qa_agent.src.core.retrieval_core import BM25, tokenize
+from enterprise_qa_agent.src.retrieval.retrieval_aux_tools import (
+    configure_retrieval_aux_tools,
+    evidence_query_score,
+    evidence_slot_score,
+    expand_auto_anchor_evidence,
+    expand_forward_evidence_ids,
+    is_expandable_anchor_evidence,
+    rerank_evidence_for_slot,
+    rerank_initial_evidence,
+    retrieve_by_key_term_coverage,
+    summary_candidate_evidence,
+)
+from enterprise_qa_agent.src.retrieval.retrieval_tools import (
+    RetrievalTools,
+    configure_basic_retrieval,
+    evidence_by_ids_strict,
+    merge_evidence,
+    page_to_evidence,
+    retrieve_multi_doc,
+    retrieve_one_doc,
+)
+from enterprise_qa_agent.src.retrieval.section_retrieval import (
+    compact_doc_tree_text,
+    compact_toc_for_docs,
+    configure_section_retrieval,
+    doc_section_catalog,
+    expand_title_pointer_evidence,
+    find_sections_referred_by_text,
+    normalize_heading_key,
+    retrieve_by_toc_hint,
+    retrieve_one_doc_by_sections,
+    section_context_evidence,
+    section_pages_as_evidence,
+    section_pages_as_evidence_ranked,
+    section_title,
+    section_title_as_evidence,
+    select_relevant_doc_sections,
+)
+from enterprise_qa_agent.src.state.state_utils import (
+    current_evidence_for_read,
+    merge_memory_slots,
+    normalize_evidence_id_list,
+    prioritize_evidence_for_review,
+    remembered_evidence_ids,
+    select_judge_evidence,
+    slot_evidence_ids,
+    slot_key,
+)
+from enterprise_qa_agent.src.prompts.task_reasoning_prompts import (
+    build_task_reasoning_audit_prompt_text,
+    build_task_reasoning_final_prompt_text,
+    build_task_reasoning_plan_prompt_text,
+    build_task_reasoning_result_prompt_text,
+)
+from enterprise_qa_agent.src.core.text_utils import compact_text, maybe_fix_mojibake
 
 
-TARGET_QID = "fin_a_020"
-# QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_reports_questions.json"
-# PAGE_INDEX_PATH = "processed/page_index_financial_reports/page_index.jsonl"
+DOMAIN_PAGE_INDEX_PATHS = {
+    "financial_contracts": "processed/page_index_financial_contracts/page_index.jsonl",
+    "financial_reports": "processed/page_index_financial_reports/page_index.jsonl",
+    "insurance": "processed/page_index_insurance/page_index.jsonl",
+    "regulatory": "processed/page_index_regulatory/page_index.jsonl",
+    "research": "processed/page_index_research/page_index.jsonl",
+}
 
-# QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_contracts_questions.json"
-# PAGE_INDEX_PATH = "processed/page_index_financial_contracts/page_index.jsonl"
-
-QUESTIONS_PATH = "public_dataset_upload/questions/group_a/financial_reports_questions.json"
-PAGE_INDEX_PATH = "processed/page_index_financial_reports/page_index.jsonl"
+RETRIEVAL_TOOLS: RetrievalTools | None = None
 
 
+def read_atomic_domain_for_startup(path: str, atomic_id: str) -> str:
+    data_path = Path(path)
+    if not data_path.exists():
+        return ""
+    try:
+        if data_path.suffix.lower() == ".jsonl":
+            with data_path.open("r", encoding="utf-8-sig") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if str(item.get("atomic_id") or item.get("qid") or "") == atomic_id:
+                        return str(item.get("domain") or "").strip()
+        else:
+            data = json.loads(data_path.read_text(encoding="utf-8-sig"))
+            rows = data if isinstance(data, list) else data.get("questions") or data.get("data") or data.get("items") or []
+            for item in rows:
+                if str(item.get("atomic_id") or item.get("qid") or "") == atomic_id:
+                    return str(item.get("domain") or "").strip()
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return ""
+    return ""
 
-ANSWER_CSV = "processed/submission/financial_reports_answer.csv"
-OUTPUT_DIR = "processed/agent_debug"
+
+TARGET_QID = os.environ.get("ATOMIC_ID", os.environ.get("TARGET_QID", "fin_b_007_A"))
+ATOMIC_QUESTIONS_PATH = os.environ.get(
+    "ATOMIC_QUESTIONS_PATH",
+    "enterprise_qa_agent/data/atomic_questions/atomic_questions_all.jsonl",
+)
+QUESTIONS_PATH = ATOMIC_QUESTIONS_PATH
+STARTUP_ATOMIC_DOMAIN = read_atomic_domain_for_startup(ATOMIC_QUESTIONS_PATH, TARGET_QID)
+PAGE_INDEX_PATH = os.environ.get(
+    "PAGE_INDEX_PATH",
+    DOMAIN_PAGE_INDEX_PATHS.get(STARTUP_ATOMIC_DOMAIN, "processed/page_index_research/page_index.jsonl"),
+)
+
+ANSWER_CSV = os.environ.get("ENTERPRISE_RESULT_JSONL", "enterprise_qa_agent/outputs/results/enterprise_results.jsonl")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "enterprise_qa_agent/outputs/debug")
 
 INITIAL_TOP_K = 4
 FOLLOWUP_TOP_K = 3
 MAX_AUDIT_ROUNDS = 3
 MAX_REASONING_AUDIT_ROUNDS = 3
-REQUEST_TIMEOUT_SECONDS = 180
-REQUEST_RETRY_TIMES = 3
-VERBOSE_CONSOLE = True
-PRINT_EVIDENCE_TEXT = True
-EVIDENCE_TEXT_PREVIEW_CHARS = 700
-COMPACT_HTML_EVIDENCE = True
+DOC_REROUTE_TOP_K = 2
+DOC_REROUTE_MIN_SCORE = 7.0
+DOC_REROUTE_MARGIN = 0.6
 SECTION_CONTEXT_PER_SECTION = 3
 SECTION_CONTEXT_MAX_TOTAL = 6
 SECTION_CONTEXT_MIN_CHARS = 20
@@ -51,29 +171,12 @@ INNER_FOCUS_SNIPPET_CHARS = 900
 LOCAL_SUBSEARCH_MIN_CHARS = 1500
 LOCAL_SUBSEARCH_MAX_SNIPPETS = 3
 LOCAL_SUBSEARCH_SNIPPET_CHARS = 760
+REVIEW_ORIGINAL_MAX_SOURCE_IDS = 3
 INITIAL_SUMMARY_CANDIDATES_PER_DOC = 2
 MAX_TOC_ROUTE_DEPTH = 4
 MAX_TOC_CHILDREN = 24
 SAVE_DEBUG_OUTPUTS = True
-APPEND_ANSWER_CSV =True
-DRY_RUN_WITHOUT_LLM = False
-DASHSCOPE_API_KEY_ENV = "DEEPSEEK_API_KEY"
-DASHSCOPE_API_KEY_FILE = "api_ds"
-DASHSCOPE_BASE_URL = "https://api.deepseek.com"
-# DASHSCOPE_API_KEY_ENV = "DASHSCOPE_API_KEY"
-# DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-# QWEN_MODEL = "qwen3.6-plus"
-# QWEN_MODEL = "qwen3.5-plus-2026-04-20"
-
-
-# 1. 鐩存帴鏄惧紡鍐欏叆鎮ㄧ殑璁鏄熻景 API Key锛堣鏇挎崲涓烘偍鐪熷疄鐨?Key锛?SPARKAI_API_KEY = "a24abac9ef09acd39638685937f0a999:NWM0ZTE1ODBlMmYyNDI4MzkxYmJlMmE3"
-# 2. 璁鏄熻景 OpenAI 鍏煎妯″紡鐨?Base URL
-SPARKAI_API_KEY_ENV = DASHSCOPE_API_KEY_ENV
-SPARKAI_API_KEY_FILE = DASHSCOPE_API_KEY_FILE
-SPARKAI_BASE_URL = DASHSCOPE_BASE_URL
-SPARKAI_CHAT_URL = f"{SPARKAI_BASE_URL.rstrip('/')}/chat/completions"
-# 3. 瑕佷娇鐢ㄧ殑妯″瀷鍚嶇О锛堜互 Qwen3.6 涓轰緥锛岃鏍规嵁骞冲彴瀹為檯鏀寔鐨勫悕绉板～鍐欙級
-QWEN_MODEL = "deepseek-chat"
+APPEND_ANSWER_CSV = False
 
 
 class AgentState(TypedDict, total=False):
@@ -99,81 +202,9 @@ class AgentState(TypedDict, total=False):
     reasoning_judgment: dict
 
 
-def maybe_fix_mojibake(text: str) -> str:
-    try:
-        fixed = text.encode("gb18030").decode("utf-8")
-    except UnicodeError:
-        return text
-    common = ("\u7684", "\u7b2c", "\u516c\u53f8", "\u53d1\u884c", "\u503a\u5238", "\u4fe1\u606f", "\u62a5\u544a")
-    mojibake = tuple(chr(code) for code in (0x951B, 0x7ED7, 0x93C9, 0x95B2, 0x9429, 0x7039, 0x5F42, 0x20AC))
-    fixed_score = sum(fixed.count(word) for word in common) * 3 - sum(fixed.count(word) for word in mojibake)
-    text_score = sum(text.count(word) for word in common) * 3 - sum(text.count(word) for word in mojibake)
-    return fixed if fixed_score > text_score else text
-
-
-def load_json(path: str) -> Any:
-    return json.loads(maybe_fix_mojibake(Path(path).read_text(encoding="utf-8")))
-
-
-def load_jsonl(path: str) -> list[dict]:
-    rows: list[dict] = []
-    with Path(path).open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    return rows
-
-
-def tokenize(text: str) -> list[str]:
-    text = maybe_fix_mojibake(text)
-    tokens: list[str] = []
-    tokens.extend(re.findall(r"[A-Za-z0-9_.%-]+", text.lower()))
-    tokens.extend(re.findall(r"[\u4e00-\u9fff]{2,}", text))
-    for word in re.findall(r"[\u4e00-\u9fff]{4,}", text):
-        tokens.extend(word[i : i + 2] for i in range(len(word) - 1))
-        tokens.extend(word[i : i + 3] for i in range(len(word) - 2))
-    return tokens
-
-
-class BM25:
-    def __init__(self, docs: list[dict], text_key: str = "index_text", k1: float = 1.5, b: float = 0.75):
-        self.docs = docs
-        self.k1 = k1
-        self.b = b
-        self.doc_tokens = [tokenize(doc.get(text_key, "")) for doc in docs]
-        self.doc_lens = [len(tokens) for tokens in self.doc_tokens]
-        self.avgdl = sum(self.doc_lens) / max(1, len(self.doc_lens))
-        self.term_freqs = [Counter(tokens) for tokens in self.doc_tokens]
-        df: dict[str, int] = defaultdict(int)
-        for tf in self.term_freqs:
-            for term in tf:
-                df[term] += 1
-        n = len(docs)
-        self.idf = {term: math.log(1 + (n - freq + 0.5) / (freq + 0.5)) for term, freq in df.items()}
-
-    def score(self, query: str, allowed_doc_ids: set[str]) -> list[tuple[float, dict]]:
-        query_terms = Counter(tokenize(query))
-        scored: list[tuple[float, dict]] = []
-        for idx, doc in enumerate(self.docs):
-            if doc["doc_id"] not in allowed_doc_ids:
-                continue
-            score = 0.0
-            tf = self.term_freqs[idx]
-            dl = self.doc_lens[idx] or 1
-            for term, qf in query_terms.items():
-                if term not in tf:
-                    continue
-                freq = tf[term]
-                idf = self.idf.get(term, 0.0)
-                denom = freq + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
-                score += idf * (freq * (self.k1 + 1) / denom) * min(qf, 3)
-            if score > 0:
-                scored.append((score, doc))
-        return sorted(scored, key=lambda item: item[0], reverse=True)
-
-
 PAGES = load_jsonl(PAGE_INDEX_PATH)
 BM25_INDEX = BM25(PAGES)
+configure_basic_retrieval(bm25_index=BM25_INDEX, fix_text=maybe_fix_mojibake)
 PAGE_BY_ID = {page["page_id"]: page for page in PAGES}
 TREE_DOC_PATH = str(Path(PAGE_INDEX_PATH).with_name("tree_doc.jsonl"))
 TREE_DOCS = load_jsonl(TREE_DOC_PATH) if Path(TREE_DOC_PATH).exists() else []
@@ -223,22 +254,6 @@ def add_usage(state: AgentState, usage: dict[str, int]) -> None:
     current["total_tokens"] += usage.get("total_tokens", 0)
 
 
-def page_to_evidence(score: float, page: dict, source: str) -> dict:
-    return {
-        "evidence_id": page["page_id"],
-        "doc_id": page["doc_id"],
-        "page_id": page["page_id"],
-        "heading_path": page.get("heading_path") or [],
-        "text": maybe_fix_mojibake(page.get("text", "")),
-        "score": round(score, 6),
-        "source": source,
-    }
-
-
-def compact_text(value: str) -> str:
-    return re.sub(r"\s+", " ", maybe_fix_mojibake(value or "")).strip()
-
-
 def is_heading_only_page(page: dict) -> bool:
     text = compact_text(page.get("text", ""))
     if len(text) < SECTION_CONTEXT_MIN_CHARS:
@@ -247,6 +262,23 @@ def is_heading_only_page(page: dict) -> bool:
     if heading and (text == heading or heading.endswith(text)):
         return True
     return False
+
+
+configure_section_retrieval(
+    bm25_index=BM25_INDEX,
+    page_by_id=PAGE_BY_ID,
+    pages_by_doc=PAGES_BY_DOC,
+    sections_by_doc=SECTIONS_BY_DOC,
+    doc_sections_by_doc=DOC_SECTIONS_BY_DOC,
+    tree_sections_by_doc=TREE_SECTIONS_BY_DOC,
+    doc_tree_text_by_id=DOC_TREE_TEXT_BY_ID,
+    is_heading_only_page=is_heading_only_page,
+    call_json=call_qwen_json,
+    add_usage=add_usage,
+    dry_run=DRY_RUN_WITHOUT_LLM,
+    section_context_per_section=SECTION_CONTEXT_PER_SECTION,
+    section_context_max_total=SECTION_CONTEXT_MAX_TOTAL,
+)
 
 
 LOW_VALUE_PAGE_TERMS = (
@@ -321,801 +353,6 @@ def is_summary_like_page(page: dict) -> bool:
     except Exception:
         return False
 
-
-def evidence_query_score(item: dict, query: str) -> float:
-    surface = evidence_surface_text(item)
-    query_tokens = set(tokenize(query))
-    surface_tokens = set(tokenize(surface))
-    score = float(item.get("score") or 0.0)
-    score += len(query_tokens & surface_tokens) * 1.5
-    for year in re.findall(r"(?:19|20)\d{2}", query or ""):
-        if year in surface:
-            score += 2.0
-    for number in re.findall(r"\d+(?:\.\d+)?\s*%?", query or ""):
-        if number and number.replace(" ", "") in surface.replace(" ", ""):
-            score += 1.0
-    if is_low_value_evidence(item):
-        score -= 12.0
-    elif any(term in compact_text(surface[:1200]) for term in SUMMARY_PAGE_TERMS):
-        score += 2.0
-    return score
-
-
-def rerank_initial_evidence(evidence: list[dict], query: str) -> list[dict]:
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for item in evidence:
-        evidence_id = str(item.get("evidence_id") or "")
-        if not evidence_id or evidence_id in seen:
-            continue
-        seen.add(evidence_id)
-        unique.append(item)
-    scored = [(evidence_query_score(item, query), idx, item) for idx, item in enumerate(unique)]
-    scored.sort(key=lambda row: (row[0], -row[1]), reverse=True)
-    return [item for _score, _idx, item in scored]
-
-
-def summary_candidate_evidence(doc_ids: list[str], query: str, source: str = "initial_summary") -> list[dict]:
-    candidates: list[dict] = []
-    for doc_id in doc_ids:
-        scored: list[tuple[float, dict]] = []
-        for page in PAGES_BY_DOC.get(doc_id, [])[:8]:
-            if not page or is_heading_only_page(page) or not is_summary_like_page(page):
-                continue
-            item = page_to_evidence(0.0, page, source)
-            score = evidence_query_score(item, query)
-            if score <= 0:
-                continue
-            scored.append((score, item))
-        scored.sort(key=lambda row: row[0], reverse=True)
-        candidates.extend(item for _score, item in scored[:INITIAL_SUMMARY_CANDIDATES_PER_DOC])
-    return candidates
-
-
-def section_context_evidence(
-    selected_sections: list[dict],
-    source: str,
-    selected_section_ids: list[str],
-    selected_section_names: list[str],
-    max_total: int = SECTION_CONTEXT_MAX_TOTAL,
-) -> list[dict]:
-    context: list[dict] = []
-    seen: set[str] = set()
-    for section in selected_sections:
-        added_for_section = 0
-        page_ids = section.get("descendant_page_ids") or section.get("page_ids") or []
-        for page_id in page_ids:
-            if len(context) >= max_total:
-                return context
-            if added_for_section >= SECTION_CONTEXT_PER_SECTION:
-                break
-            if page_id in seen:
-                continue
-            page = PAGE_BY_ID.get(page_id)
-            if not page or is_heading_only_page(page):
-                continue
-            item = page_to_evidence(0.0, page, source + "_context")
-            item["selected_section_ids"] = selected_section_ids
-            item["selected_sections"] = selected_section_names
-            context.append(item)
-            seen.add(page_id)
-            added_for_section += 1
-    return context
-
-
-TITLE_POINTER_RE = re.compile(
-    r"(?m)(?:^|\s)(?:第[一二三四五六七八九十百千万\d]+[章节条]|[一二三四五六七八九十]+[、.]|\d+(?:\.\d+)+|[（(]\d+[）)]|[①②③④⑤⑥⑦⑧⑨⑩])\s*[^。\n]{1,40}"
-)
-
-
-def normalize_heading_key(text: str) -> str:
-    fixed = maybe_fix_mojibake(str(text or ""))
-    fixed = re.sub(r"\s+", "", fixed)
-    fixed = re.sub(r"[，,。；;：:、.．（）()《》<>【】\[\]\"'“”‘’]", "", fixed)
-    return fixed.lower()
-
-
-def section_pages_as_evidence(
-    section: dict,
-    source: str,
-    selected_section_ids: list[str],
-    selected_section_names: list[str],
-    max_pages: int = 2,
-) -> list[dict]:
-    evidence: list[dict] = []
-    for page_id in section.get("descendant_page_ids") or section.get("page_ids") or []:
-        if len(evidence) >= max_pages:
-            break
-        page = PAGE_BY_ID.get(page_id)
-        if not page or is_heading_only_page(page):
-            continue
-        item = page_to_evidence(0.0, page, source)
-        item["selected_section_ids"] = selected_section_ids
-        item["selected_sections"] = selected_section_names
-        item["pointer_expanded_from"] = section.get("section_id")
-        evidence.append(item)
-    return evidence
-
-
-def section_pages_as_evidence_ranked(
-    section: dict,
-    query: str,
-    source: str,
-    selected_section_ids: list[str],
-    selected_section_names: list[str],
-    max_pages: int = 2,
-) -> list[dict]:
-    page_ids = section.get("descendant_page_ids") or section.get("page_ids") or []
-    pages = [PAGE_BY_ID.get(page_id) for page_id in page_ids]
-    pages = [page for page in pages if page and not is_heading_only_page(page)]
-    if not pages:
-        return []
-    query_tokens = set(tokenize(query or section_title(section)))
-    scored: list[tuple[float, dict]] = []
-    for page in pages:
-        heading_text = " > ".join(page.get("heading_path") or [])
-        if any(term in compact_text(heading_text + " " + page.get("text", "")[:80]) for term in ("内容目录", "图表目录")):
-            continue
-        text = " ".join(
-            [
-                heading_text,
-                page.get("index_text", ""),
-                page.get("text", ""),
-            ]
-        )
-        page_tokens = set(tokenize(text))
-        score = float(len(query_tokens & page_tokens))
-        for year in re.findall(r"(?:19|20)\d{2}", query or ""):
-            if year in text:
-                score += 2.0
-        for number in re.findall(r"\d+(?:\.\d+)?\s*%", query or ""):
-            if number.replace(" ", "") in text.replace(" ", ""):
-                score += 3.0
-        scored.append((score, page))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    evidence: list[dict] = []
-    for score, page in scored[:max_pages]:
-        item = page_to_evidence(score, page, source)
-        item["selected_section_ids"] = selected_section_ids
-        item["selected_sections"] = selected_section_names
-        item["pointer_expanded_from"] = section.get("section_id")
-        evidence.append(item)
-    return evidence
-
-
-def section_title_as_evidence(
-    section: dict,
-    source: str,
-    selected_section_ids: list[str],
-    selected_section_names: list[str],
-) -> dict | None:
-    section_id = str(section.get("section_id") or "")
-    doc_id = str(section.get("doc_id") or "")
-    title = section_title(section)
-    heading_path = [maybe_fix_mojibake(str(item)) for item in section.get("heading_path") or []]
-    preview = compact_text(section.get("preview", ""))
-    text_parts = []
-    if heading_path:
-        text_parts.append(" > ".join(heading_path))
-    elif title:
-        text_parts.append(title)
-    if preview and preview not in text_parts[-1:]:
-        text_parts.append(preview)
-    text = "\n".join(part for part in text_parts if part).strip()
-    if not section_id or not doc_id or not text:
-        return None
-    return {
-        "evidence_id": f"{section_id}_toc_title",
-        "doc_id": doc_id,
-        "page_id": "",
-        "heading_path": heading_path or [title],
-        "text": text,
-        "score": 0.0,
-        "source": source,
-        "selected_section_ids": selected_section_ids,
-        "selected_sections": selected_section_names,
-        "pointer_expanded_from": section_id,
-    }
-
-
-def find_sections_referred_by_text(doc_id: str, text: str, exclude_section_ids: set[str] | None = None) -> list[dict]:
-    compact = compact_text(text)
-    if not compact or len(compact) > 260:
-        return []
-    exclude_section_ids = exclude_section_ids or set()
-    candidates = []
-    for match in TITLE_POINTER_RE.finditer(compact):
-        title = maybe_fix_mojibake(match.group(0)).strip()
-        if title:
-            candidates.append(title)
-    if not candidates:
-        candidates = [compact]
-    candidate_keys = [normalize_heading_key(item) for item in candidates]
-    matched: list[dict] = []
-    for section in DOC_SECTIONS_BY_DOC.get(doc_id, []):
-        section_id = str(section.get("section_id") or "")
-        if section_id in exclude_section_ids:
-            continue
-        section_keys = [
-            normalize_heading_key(section_title(section)),
-            normalize_heading_key(" > ".join(section.get("heading_path") or [])),
-        ]
-        for candidate_key in candidate_keys:
-            if not candidate_key:
-                continue
-            if any(candidate_key == key or candidate_key in key or key in candidate_key for key in section_keys):
-                if section not in matched:
-                    matched.append(section)
-                break
-        if len(matched) >= 3:
-            break
-    return matched
-
-
-def expand_title_pointer_evidence(evidence: list[dict], source: str) -> list[dict]:
-    expanded: list[dict] = []
-    for item in evidence:
-        text = compact_text(item.get("text", ""))
-        if len(text) > 260:
-            continue
-        selected_ids = {str(section_id) for section_id in item.get("selected_section_ids") or []}
-        referred_sections = find_sections_referred_by_text(item.get("doc_id", ""), text, selected_ids)
-        for section in referred_sections:
-            section_id = str(section.get("section_id") or "")
-            section_name = section_title(section)
-            expanded.extend(
-                section_pages_as_evidence(
-                    section,
-                    source + "_pointer",
-                    list(dict.fromkeys(list(selected_ids) + [section_id])),
-                    list(dict.fromkeys((item.get("selected_sections") or []) + [section_name])),
-                )
-            )
-    return expanded
-
-
-def retrieve_one_doc(query: str, doc_id: str, top_k: int, source: str) -> list[dict]:
-    hits = BM25_INDEX.score(query, allowed_doc_ids={doc_id})[:top_k]
-    return [page_to_evidence(score, page, source) for score, page in hits]
-
-
-def retrieve_multi_doc(query: str, doc_ids: list[str], top_k_per_doc: int, source: str) -> list[dict]:
-    evidence: list[dict] = []
-    for doc_id in doc_ids:
-        evidence.extend(retrieve_one_doc(query, doc_id, top_k_per_doc, source))
-    return evidence
-
-
-def section_score(query: str, heading: str, pages: list[dict]) -> float:
-    query_tokens = set(tokenize(query))
-    if not query_tokens:
-        return 0.0
-    heading_text = maybe_fix_mojibake(heading)
-    heading_tokens = set(tokenize(heading_text))
-    sample_text = "\n".join(maybe_fix_mojibake(page.get("index_text", ""))[:300] for page in pages[:3])
-    sample_tokens = set(tokenize(sample_text))
-    score = 0.0
-    score += 3.0 * len(query_tokens & heading_tokens)
-    score += 1.0 * len(query_tokens & sample_tokens)
-    return score
-
-
-def select_relevant_sections(query: str, doc_id: str, top_n: int = 3) -> list[str]:
-    sections = SECTIONS_BY_DOC.get(doc_id, {})
-    scored = [
-        (section_score(query, heading, pages), heading)
-        for heading, pages in sections.items()
-    ]
-    scored = [(score, heading) for score, heading in scored if score > 0]
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [heading for _score, heading in scored[:top_n]]
-
-
-def doc_section_catalog(doc_id: str, max_sections: int = 80) -> list[str]:
-    headings = list(SECTIONS_BY_DOC.get(doc_id, {}).keys())
-    headings.sort()
-    return headings[:max_sections]
-
-
-def compact_doc_tree_text(doc_id: str, max_lines: int = 120) -> str:
-    text = DOC_TREE_TEXT_BY_ID.get(doc_id, "")
-    if not text:
-        return ""
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-    return "\n".join(lines)
-
-
-def doc_section_score(query: str, section: dict) -> float:
-    query_tokens = set(tokenize(query))
-    if not query_tokens:
-        return 0.0
-    heading = " ".join(section.get("heading_path") or [])
-    heading_text = maybe_fix_mojibake(heading)
-    heading_tokens = set(tokenize(heading_text))
-    return 4.0 * len(query_tokens & heading_tokens)
-
-
-def select_relevant_doc_sections(query: str, doc_id: str, top_n: int = 3) -> list[dict]:
-    sections = DOC_SECTIONS_BY_DOC.get(doc_id, [])
-    scored = [(doc_section_score(query, section), section) for section in sections]
-    scored = [(score, section) for score, section in scored if score > 0]
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [section for _score, section in scored[:top_n]]
-
-
-def select_relevant_doc_sections_with_llm(
-    query: str,
-    slot: str,
-    doc_id: str,
-    top_n: int = 3,
-    state: AgentState | None = None,
-) -> list[dict]:
-    tree_text = compact_doc_tree_text(doc_id)
-    sections = DOC_SECTIONS_BY_DOC.get(doc_id, [])
-    if not tree_text or not sections:
-        return []
-    system = (
-        "你是目录路由Agent。只根据任务、槽位和目录标题选择最可能包含证据的section_id。"
-        "优先选择现金价值、账户价值、费用比例、给付规则、年度区间等计算依据章节，避免只选手续流程章节。"
-        "只输出JSON。"
-    )
-    user = f"""
-slot: {maybe_fix_mojibake(slot)}
-query: {maybe_fix_mojibake(query)}
-doc_id: {doc_id}
-
-title tree:
-{tree_text}
-
-Return JSON:
-{{
-  "section_ids": ["section id from title tree"]
-}}
-"""
-    if DRY_RUN_WITHOUT_LLM:
-        return select_relevant_doc_sections(query, doc_id, top_n)
-    try:
-        output, usage = call_qwen_json(system, user)
-        if state is not None:
-            add_usage(state, usage)
-    except Exception:
-        return select_relevant_doc_sections(query, doc_id, top_n)
-    by_id = {section.get("section_id"): section for section in sections}
-    selected: list[dict] = []
-    for section_id in output.get("section_ids") or []:
-        section_id = str(section_id).strip()
-        section = by_id.get(section_id)
-        if section and section not in selected:
-            selected.append(section)
-        if len(selected) >= top_n:
-            break
-    return selected or select_relevant_doc_sections(query, doc_id, top_n)
-
-
-def tree_section_catalog(doc_id: str, max_sections: int = 80) -> list[dict]:
-    sections = TREE_SECTIONS_BY_DOC.get(doc_id, [])
-    items: list[dict] = []
-    for section in sections[:max_sections]:
-        heading = " > ".join(section.get("heading_path") or [])
-        items.append(
-            {
-                "section_id": section.get("section_id"),
-                "level": section.get("level"),
-                "heading": maybe_fix_mojibake(heading),
-                "preview": maybe_fix_mojibake(section.get("preview") or "")[:160],
-            }
-        )
-    return items
-
-
-def tree_section_score(query: str, section: dict) -> float:
-    query_tokens = set(tokenize(query))
-    if not query_tokens:
-        return 0.0
-    heading = " ".join(section.get("heading_path") or [])
-    preview = section.get("preview") or ""
-    heading_tokens = set(tokenize(maybe_fix_mojibake(heading)))
-    preview_tokens = set(tokenize(maybe_fix_mojibake(preview)))
-    score = 0.0
-    score += 4.0 * len(query_tokens & heading_tokens)
-    score += 1.0 * len(query_tokens & preview_tokens)
-    return score
-
-
-def select_relevant_tree_sections(query: str, doc_id: str, top_n: int = 3) -> list[dict]:
-    sections = TREE_SECTIONS_BY_DOC.get(doc_id, [])
-    scored = [
-        (tree_section_score(query, section), section)
-        for section in sections
-    ]
-    scored = [(score, section) for score, section in scored if score > 0]
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [section for _score, section in scored[:top_n]]
-
-
-def select_relevant_tree_sections_with_llm(
-    query: str,
-    slot: str,
-    doc_id: str,
-    top_n: int = 3,
-    state: AgentState | None = None,
-) -> list[dict]:
-    catalog = tree_section_catalog(doc_id)
-    if not catalog:
-        return []
-    system = (
-        "You are a table-of-contents router for retrieval. "
-        "Choose section_id values that are most likely to contain evidence for the slot. "
-        "Only choose from the given catalog. Do not invent ids. "
-        "Prefer headings about the requested benefit, amount, cash value, surrender, ratio, age band, definition, or table. "
-        "Return JSON only."
-    )
-    user = f"""
-slot: {maybe_fix_mojibake(slot)}
-query: {maybe_fix_mojibake(query)}
-doc_id: {doc_id}
-
-catalog:
-{json.dumps(catalog, ensure_ascii=False, indent=2)}
-
-Return JSON:
-{{
-  "section_ids": ["section id from catalog"]
-}}
-"""
-    if DRY_RUN_WITHOUT_LLM:
-        return select_relevant_tree_sections(query, doc_id, top_n)
-    try:
-        output, usage = call_qwen_json(system, user)
-        if state is not None:
-            add_usage(state, usage)
-    except Exception:
-        return select_relevant_tree_sections(query, doc_id, top_n)
-    by_id = {section.get("section_id"): section for section in TREE_SECTIONS_BY_DOC.get(doc_id, [])}
-    selected: list[dict] = []
-    for section_id in output.get("section_ids") or []:
-        section_id = str(section_id).strip()
-        section = by_id.get(section_id)
-        if section and section not in selected:
-            selected.append(section)
-        if len(selected) >= top_n:
-            break
-    return selected or select_relevant_tree_sections(query, doc_id, top_n)
-
-
-def select_relevant_sections_with_llm(
-    query: str,
-    slot: str,
-    doc_id: str,
-    top_n: int = 3,
-    state: AgentState | None = None,
-) -> list[str]:
-    catalog = doc_section_catalog(doc_id)
-    if not catalog:
-        return []
-    system = (
-        "你是目录导航Agent。根据槽位、检索词和章节列表，选择最可能包含证据的章节。"
-        "只能从给定sections中选择，最多选择3个。只输出JSON。"
-    )
-    user = f"""
-槽位：{maybe_fix_mojibake(slot)}
-检索词：{maybe_fix_mojibake(query)}
-doc_id：{doc_id}
-
-sections：
-{json.dumps(catalog, ensure_ascii=False, indent=2)}
-
-请输出：
-{{
-  "sections": ["从sections中原样复制的章节名"]
-}}
-"""
-    if DRY_RUN_WITHOUT_LLM:
-        return select_relevant_sections(query, doc_id, top_n)
-    try:
-        output, usage = call_qwen_json(system, user)
-        if state is not None:
-            add_usage(state, usage)
-    except Exception:
-        return select_relevant_sections(query, doc_id, top_n)
-    allowed = set(catalog)
-    selected = []
-    for heading in output.get("sections") or []:
-        heading = str(heading).strip()
-        if heading in allowed and heading not in selected:
-            selected.append(heading)
-        if len(selected) >= top_n:
-            break
-    return selected or select_relevant_sections(query, doc_id, top_n)
-
-
-def retrieve_one_doc_by_sections(
-    query: str,
-    doc_id: str,
-    top_k: int,
-    source: str,
-    section_top_n: int = 3,
-    slot: str = "",
-    use_llm_sections: bool = False,
-    state: AgentState | None = None,
-) -> list[dict]:
-    doc_sections = DOC_SECTIONS_BY_DOC.get(doc_id, [])
-    if doc_sections:
-        if use_llm_sections:
-            selected_doc_sections = select_relevant_doc_sections_with_llm(
-                query,
-                slot or query,
-                doc_id,
-                section_top_n,
-                state=state,
-            )
-        else:
-            selected_doc_sections = select_relevant_doc_sections(query, doc_id, section_top_n)
-        if selected_doc_sections:
-            allowed_page_ids = {
-                page_id
-                for section in selected_doc_sections
-                for page_id in (section.get("descendant_page_ids") or section.get("page_ids") or [])
-            }
-            hits = [
-                (score, page)
-                for score, page in BM25_INDEX.score(query, allowed_doc_ids={doc_id})
-                if page.get("page_id") in allowed_page_ids
-            ][:top_k]
-            selected_sections = [
-                " > ".join(section.get("heading_path") or [])
-                for section in selected_doc_sections
-            ]
-            selected_section_ids = [section.get("section_id") for section in selected_doc_sections]
-            if hits:
-                evidence = [page_to_evidence(score, page, source + "_doc_tree_section") for score, page in hits]
-                for item in evidence:
-                    item["selected_section_ids"] = selected_section_ids
-                    item["selected_sections"] = selected_sections
-                context = section_context_evidence(
-                    selected_doc_sections,
-                    source + "_doc_tree_section",
-                    selected_section_ids,
-                    selected_sections,
-                )
-                evidence = merge_evidence(evidence, context)
-                return evidence
-            context = section_context_evidence(
-                selected_doc_sections,
-                source + "_doc_tree_section",
-                selected_section_ids,
-                selected_sections,
-            )
-            if context:
-                return context
-
-    tree_sections = TREE_SECTIONS_BY_DOC.get(doc_id, [])
-    if tree_sections:
-        if use_llm_sections:
-            selected_tree_sections = select_relevant_tree_sections_with_llm(
-                query,
-                slot or query,
-                doc_id,
-                section_top_n,
-                state=state,
-            )
-        else:
-            selected_tree_sections = select_relevant_tree_sections(query, doc_id, section_top_n)
-        if selected_tree_sections:
-            allowed_page_ids = {
-                page_id
-                for section in selected_tree_sections
-                for page_id in (section.get("descendant_page_ids") or section.get("page_ids") or [])
-            }
-            hits = [
-                (score, page)
-                for score, page in BM25_INDEX.score(query, allowed_doc_ids={doc_id})
-                if page.get("page_id") in allowed_page_ids
-            ][:top_k]
-            selected_sections = [
-                " > ".join(section.get("heading_path") or [])
-                for section in selected_tree_sections
-            ]
-            selected_section_ids = [section.get("section_id") for section in selected_tree_sections]
-            if hits:
-                evidence = [page_to_evidence(score, page, source + "_tree_section") for score, page in hits]
-                for item in evidence:
-                    item["selected_section_ids"] = selected_section_ids
-                    item["selected_sections"] = selected_sections
-                context = section_context_evidence(
-                    selected_tree_sections,
-                    source + "_tree_section",
-                    selected_section_ids,
-                    selected_sections,
-                )
-                evidence = merge_evidence(evidence, context)
-                return evidence
-            context = section_context_evidence(
-                selected_tree_sections,
-                source + "_tree_section",
-                selected_section_ids,
-                selected_sections,
-            )
-            if context:
-                return context
-
-    if use_llm_sections:
-        section_headings = select_relevant_sections_with_llm(
-            query,
-            slot or query,
-            doc_id,
-            section_top_n,
-            state=state,
-        )
-    else:
-        section_headings = select_relevant_sections(query, doc_id, section_top_n)
-    if not section_headings:
-        return retrieve_one_doc(query, doc_id, top_k, source + "_doc")
-    allowed_page_ids = {
-        page.get("page_id")
-        for heading in section_headings
-        for page in SECTIONS_BY_DOC.get(doc_id, {}).get(heading, [])
-    }
-    hits = [
-        (score, page)
-        for score, page in BM25_INDEX.score(query, allowed_doc_ids={doc_id})
-        if page.get("page_id") in allowed_page_ids
-    ][:top_k]
-    if not hits:
-        return retrieve_one_doc(query, doc_id, top_k, source + "_doc_fallback")
-    evidence = [page_to_evidence(score, page, source + "_section") for score, page in hits]
-    for item in evidence:
-        item["selected_sections"] = section_headings
-    return evidence
-
-
-def retrieve_multi_doc_by_sections(
-    query: str,
-    doc_ids: list[str],
-    top_k_per_doc: int,
-    source: str,
-    slot: str = "",
-    use_llm_sections: bool = False,
-    state: AgentState | None = None,
-) -> list[dict]:
-    evidence: list[dict] = []
-    for doc_id in doc_ids:
-        evidence.extend(
-            retrieve_one_doc_by_sections(
-                query,
-                doc_id,
-                top_k_per_doc,
-                source,
-                slot=slot,
-                use_llm_sections=use_llm_sections,
-                state=state,
-            )
-        )
-    return evidence
-
-
-def expand_neighbor_evidence(evidence: list[dict], window: int = 2, source_suffix: str = "_neighbor") -> list[dict]:
-    expanded: list[dict] = []
-    seen = {item["evidence_id"] for item in evidence}
-    for item in evidence:
-        pages = PAGES_BY_DOC.get(item["doc_id"], [])
-        page_indexes = [idx for idx, page in enumerate(pages) if page.get("page_id") == item["page_id"]]
-        if not page_indexes:
-            continue
-        idx = page_indexes[0]
-        for neighbor_idx in range(max(0, idx - window), min(len(pages), idx + window + 1)):
-            page = pages[neighbor_idx]
-            page_id = page.get("page_id")
-            if not page_id or page_id in seen:
-                continue
-            expanded.append(page_to_evidence(item.get("score", 0.0), page, item.get("source", "") + source_suffix))
-            seen.add(page_id)
-    return expanded
-
-
-def expand_forward_evidence_ids(
-    evidence: list[dict],
-    evidence_ids: list[str],
-    forward: int = 4,
-    source_suffix: str = "_anchor_expand",
-) -> list[dict]:
-    expanded: list[dict] = []
-    requested = {str(evidence_id) for evidence_id in evidence_ids or [] if evidence_id}
-    if not requested:
-        return expanded
-    seen = {item["evidence_id"] for item in evidence}
-    for item in evidence:
-        if item["evidence_id"] not in requested:
-            continue
-        if not is_expandable_anchor_evidence(item):
-            if VERBOSE_CONSOLE:
-                print(f"[anchor expand skipped] id={item['evidence_id']} reason=not_incomplete_anchor", flush=True)
-            continue
-        pages = PAGES_BY_DOC.get(item["doc_id"], [])
-        page_indexes = [idx for idx, page in enumerate(pages) if page.get("page_id") == item["page_id"]]
-        if not page_indexes:
-            continue
-        idx = page_indexes[0]
-        for next_idx in range(idx + 1, min(len(pages), idx + forward + 1)):
-            page = pages[next_idx]
-            page_id = page.get("page_id")
-            if not page_id or page_id in seen:
-                continue
-            expanded.append(page_to_evidence(item.get("score", 0.0), page, item.get("source", "") + source_suffix))
-            seen.add(page_id)
-    return expanded
-
-
-def expand_auto_anchor_evidence(
-    evidence: list[dict],
-    forward: int = 2,
-    source_suffix: str = "_auto_anchor_expand",
-) -> list[dict]:
-    anchor_ids = [
-        item.get("evidence_id")
-        for item in evidence
-        if item.get("evidence_id") and is_expandable_anchor_evidence(item)
-    ]
-    return expand_forward_evidence_ids(evidence, anchor_ids, forward=forward, source_suffix=source_suffix)
-
-
-def is_expandable_anchor_evidence(item: dict) -> bool:
-    text = maybe_fix_mojibake(str(item.get("text") or "")).strip()
-    compact = re.sub(r"\s+", "", text)
-    lower_text = text.lower()
-    if not compact:
-        return False
-    if "<table" in lower_text or "</table" in lower_text or lower_text.count("<tr") >= 2:
-        return False
-    if len(compact) > 180:
-        return False
-    anchor_endings = (
-        "为：",
-        "为:",
-        "公式：",
-        "公式:",
-        "如下：",
-        "如下:",
-        "其中：",
-        "其中:",
-        "下表：",
-        "下表:",
-        "下列：",
-        "下列:",
-        "如下",
-    )
-    if compact.endswith(anchor_endings):
-        return True
-    anchor_phrases = (
-        "比例为",
-        "数值为",
-        "标准为",
-        "如下",
-        "见下表",
-        "下表",
-        "下列",
-        "以下公式",
-        "如下公式",
-        "按照以下公式",
-        "按以下公式",
-        "计算并给付",
-        "计算公式",
-    )
-    tail = compact[-40:]
-    return any(phrase in tail for phrase in anchor_phrases) and not re.search(r"\d+%|<td>|</td>", tail)
-
-
-def merge_evidence(existing: list[dict], incoming: list[dict]) -> list[dict]:
-    seen = {item["evidence_id"] for item in existing}
-    merged = list(existing)
-    for item in incoming:
-        if item["evidence_id"] in seen:
-            continue
-        merged.append(item)
-        seen.add(item["evidence_id"])
-    return merged
 
 
 REFERENCE_TARGET_RE = re.compile(
@@ -1331,67 +568,6 @@ def result_contains_unsupported_assumption(
     return any(term in text for term in ("比例", "费率", "金额", "赔付", "给付", "责任项"))
 
 
-class CompactHTMLParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"tr", "p", "div", "br", "h1", "h2", "h3", "h4", "li"}:
-            self.parts.append("\n")
-        elif tag in {"td", "th"}:
-            self.parts.append(" | ")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"tr", "p", "div", "h1", "h2", "h3", "h4", "li"}:
-            self.parts.append("\n")
-        elif tag in {"td", "th"}:
-            self.parts.append(" | ")
-
-    def handle_data(self, data: str) -> None:
-        text = data.strip()
-        if text:
-            self.parts.append(text)
-
-    def text(self) -> str:
-        text = "".join(self.parts)
-        text = re.sub(r"[ \t]*\|[ \t]*", " | ", text)
-        text = re.sub(r"(?:[ \t]*\|[ \t]*){2,}", " | ", text)
-        lines = [re.sub(r"\s+", " ", line).strip(" |") for line in text.splitlines()]
-        return "\n".join(line for line in lines if line)
-
-
-def compact_html_text(text: str) -> str:
-    if not COMPACT_HTML_EVIDENCE or "<" not in text or ">" not in text:
-        return text
-    parser = CompactHTMLParser()
-    try:
-        parser.feed(text)
-        compacted = parser.text()
-    except Exception:
-        compacted = re.sub(r"<[^>]+>", " ", text)
-    compacted = unescape(compacted)
-    compacted = re.sub(r"\n{3,}", "\n\n", compacted).strip()
-    return compacted or text
-
-
-def format_evidence(evidence: list[dict], max_chars: int = 7000) -> str:
-    chunks: list[str] = []
-    used = 0
-    for item in evidence:
-        text = compact_html_text(item.get("text", ""))
-        text = re.sub(r"[ \t]+", " ", text).strip()
-        if used >= max_chars:
-            break
-        remaining = max_chars - used
-        if len(text) > remaining:
-            text = text[:remaining]
-        heading = " > ".join(item.get("heading_path") or [])
-        chunks.append(f"[{item['evidence_id']}] doc={item['doc_id']} heading={heading}\n{text}")
-        used += len(text)
-    return "\n\n".join(chunks)
-
-
 EVIDENCE_NOTE_TERMS = (
     "保险责任",
     "责任免除",
@@ -1526,36 +702,6 @@ def update_task_evidence_notes(
     if len(merged) > max_total:
         merged = merged[-max_total:]
     return merged
-
-
-def format_evidence_notes(notes: list[dict], max_chars: int = 1800) -> str:
-    if not notes:
-        return "[]"
-    lines: list[str] = []
-    used = 0
-    for note in notes:
-        text = compact_text(str(note.get("note") or ""))
-        if not text:
-            continue
-        line = (
-            f"- [{note.get('source_evidence_id')}] doc={note.get('doc_id')} "
-            f"heading={note.get('heading')}: {text}"
-        )
-        if used + len(line) > max_chars:
-            break
-        lines.append(line)
-        used += len(line)
-    return "\n".join(lines) if lines else "[]"
-
-
-def print_evidence_preview(evidence: list[dict]) -> None:
-    for ev in evidence:
-        heading = " > ".join(ev.get("heading_path") or [])
-        print(f"- {ev['doc_id']} {ev['page_id']} score={ev['score']:.3f} heading={heading}", flush=True)
-        if PRINT_EVIDENCE_TEXT:
-            text = re.sub(r"\s+", " ", ev.get("text", "")).strip()
-            preview = text[:EVIDENCE_TEXT_PREVIEW_CHARS].encode("gbk", errors="replace").decode("gbk")
-            print(f"  text: {preview}", flush=True)
 
 
 def missing_query_text(missing_slots: list) -> str:
@@ -1899,7 +1045,7 @@ def build_inner_focus_evidence(option_state: dict, missing_slots: list) -> list[
     if not query:
         return []
     scored: list[tuple[float, dict]] = []
-    for ev in option_state.get("evidence", []) or []:
+    for ev in prioritize_evidence_for_review(option_state):
         text = ev.get("text", "")
         if len(compact_text(text)) <= INNER_FOCUS_MIN_CHARS:
             continue
@@ -1944,121 +1090,21 @@ def option_slot_query_text(option_state: dict) -> str:
     return maybe_fix_mojibake(" ".join(part for part in parts if part)).strip()
 
 
-def split_long_evidence_for_subsearch(text: str) -> list[str]:
-    text = compact_html_text(maybe_fix_mojibake(text or ""))
-    text = re.sub(r"[ \t]+", " ", text)
-    if len(compact_text(text)) <= LOCAL_SUBSEARCH_MIN_CHARS:
-        return []
-
-    starts = {0}
-    anchor_patterns = [
-        r"(?:^|\n)\s*(?:图|表)\s*[\d一二三四五六七八九十]+[：:]",
-        r"(?:^|\n)\s*(?:\d+[）)]|[（(]\d+[）)]|[①②③④⑤⑥⑦⑧⑨⑩])",
-        r"(?:^|\n)\s*(?:首先|其次|再次|最后|一是|二是|三是|四是)[，,：:]",
-        r"(?:^|\n)\s*(?:居民收入端|居民资产端|收入端|资产端|更为关键的是)[，,：:]",
-        r"(?:^|\n)\s*\|.+\|\s*(?:\n|$)",
-        r"<table\b",
-    ]
-    for pattern in anchor_patterns:
-        for match in re.finditer(pattern, text, flags=re.I):
-            starts.add(match.start())
-    for match in re.finditer(r"\n{2,}", text):
-        starts.add(match.end())
-
-    ordered = sorted(start for start in starts if 0 <= start < len(text))
-    raw_segments: list[str] = []
-    for idx, start in enumerate(ordered):
-        end = ordered[idx + 1] if idx + 1 < len(ordered) else len(text)
-        segment = text[start:end].strip()
-        if len(compact_text(segment)) >= 80:
-            raw_segments.append(segment)
-
-    merged: list[str] = []
-    buffer = ""
-    for segment in raw_segments:
-        candidate = (buffer + "\n\n" + segment).strip() if buffer else segment
-        if len(candidate) < 180:
-            buffer = candidate
-            continue
-        merged.append(candidate)
-        buffer = ""
-    if buffer:
-        merged.append(buffer)
-
-    chunks: list[str] = []
-    for segment in merged or [text]:
-        if len(segment) <= LOCAL_SUBSEARCH_SNIPPET_CHARS:
-            chunks.append(segment)
-            continue
-        table_focus = focus_markdown_table_snippet(segment, "", max_chars=LOCAL_SUBSEARCH_SNIPPET_CHARS)
-        if table_focus and len(table_focus) >= 80:
-            chunks.append(table_focus)
-            continue
-        step = max(360, LOCAL_SUBSEARCH_SNIPPET_CHARS // 2)
-        for start in range(0, len(segment), step):
-            window = segment[start : start + LOCAL_SUBSEARCH_SNIPPET_CHARS]
-            if len(compact_text(window)) >= 100:
-                chunks.append(window.strip())
-            if start + LOCAL_SUBSEARCH_SNIPPET_CHARS >= len(segment):
-                break
-    return chunks
-
-
-def local_subsearch_score(snippet: str, query: str) -> float:
-    score = inner_focus_score(snippet, query)
-    query_text = maybe_fix_mojibake(query or "")
-    snippet_text = maybe_fix_mojibake(snippet or "")
-    query_numbers = set(re.findall(r"\d+(?:\.\d+)?%?|\d{4}", query_text))
-    snippet_numbers = set(re.findall(r"\d+(?:\.\d+)?%?|\d{4}", snippet_text))
-    score += len(query_numbers & snippet_numbers) * 2.0
-    if any(term in snippet_text for term in ("同比", "增速", "增长", "下降", "收入", "利润", "费用", "现金价值", "比例")):
-        score += 0.8
-    if re.search(r"(?:图|表)\s*[\d一二三四五六七八九十]+[：:]", snippet_text):
-        score += 0.5
-    return score
-
-
-def subsearch_long_new_evidence(state: AgentState, source: str) -> list[dict]:
-    option = state["current_option"]
-    option_state = state["option_states"][option]
-    query = local_subsearch_query(state, option_state)
-    if not query:
-        return []
-    evidence_by_id = {item.get("evidence_id"): item for item in option_state.get("evidence", []) or []}
-    scored: list[tuple[float, dict]] = []
-    for evidence_id in option_state.get("new_evidence_ids") or []:
-        ev = evidence_by_id.get(evidence_id)
-        if not ev:
-            continue
-        ev_source = str(ev.get("source") or "")
-        if ev_source in {"evidence_extract", "evidence_inner_focus", "evidence_local_subsearch"}:
-            continue
-        text = ev.get("text", "")
-        if len(compact_text(text)) <= LOCAL_SUBSEARCH_MIN_CHARS:
-            continue
-        for idx, snippet in enumerate(split_long_evidence_for_subsearch(text)):
-            focused_text = focus_inner_snippet(snippet, query)
-            score = local_subsearch_score(focused_text, query)
-            if score <= 0:
-                continue
-            focused = dict(ev)
-            focused["evidence_id"] = f"{evidence_id}_sub_{idx}"
-            focused["page_id"] = focused["evidence_id"]
-            focused["text"] = focused_text[:LOCAL_SUBSEARCH_SNIPPET_CHARS]
-            focused["score"] = round(score, 6)
-            focused["source"] = "evidence_local_subsearch"
-            focused["focused_from"] = evidence_id
-            focused["subsearch_source"] = source
-            scored.append((score, focused))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [item for _score, item in scored[:LOCAL_SUBSEARCH_MAX_SNIPPETS]]
-
 
 def apply_local_subsearch_to_new_evidence(state: AgentState, source: str) -> None:
     option = state["current_option"]
     option_state = state["option_states"][option]
     original_new_ids = list(option_state.get("new_evidence_ids") or [])
-    focused = subsearch_long_new_evidence(state, source)
+    query = local_subsearch_query(state, option_state)
+    focused = get_retrieval_tools().local_subsearch(
+        evidence=option_state.get("evidence", []),
+        evidence_ids=original_new_ids,
+        query=query,
+        source=source,
+        min_chars=LOCAL_SUBSEARCH_MIN_CHARS,
+        max_snippets=LOCAL_SUBSEARCH_MAX_SNIPPETS,
+        snippet_chars=LOCAL_SUBSEARCH_SNIPPET_CHARS,
+    )["evidence"]
     if not focused:
         return
     option_state["evidence"] = merge_evidence(option_state.get("evidence", []), focused)
@@ -2076,26 +1122,43 @@ def apply_local_subsearch_to_new_evidence(state: AgentState, source: str) -> Non
         print_evidence_preview(focused)
 
 
-def merge_memory_slots(existing: list[dict], filled_slots: list[dict]) -> list[dict]:
-    merged = list(existing)
-    index = {item.get("slot"): idx for idx, item in enumerate(merged)}
-    for item in filled_slots or []:
-        if not isinstance(item, dict):
+
+def normalize_key_terms(values: list | None, fallback_text: str = "", max_terms: int = 10) -> list[str]:
+    terms: list[str] = []
+    for value in values or []:
+        term = maybe_fix_mojibake(str(value or "")).strip()
+        term = re.sub(r"\s+", "", term)
+        if len(term) < 2:
             continue
-        slot = str(item.get("slot") or "").strip()
-        if not slot:
+        if re.fullmatch(r"[，。；、,.。:：]+", term):
             continue
-        compact = {
-            "slot": slot[:80],
-            "value": str(item.get("value") or "")[:160],
-            "evidence_ids": list(item.get("evidence_ids") or [])[:5],
-        }
-        if slot in index:
-            merged[index[slot]] = compact
-        else:
-            index[slot] = len(merged)
-            merged.append(compact)
-    return merged
+        if term not in terms:
+            terms.append(term[:40])
+    if not terms and fallback_text:
+        fallback = maybe_fix_mojibake(fallback_text)
+        for token in tokenize(fallback):
+            token = maybe_fix_mojibake(str(token or "")).strip()
+            if len(token) < 2:
+                continue
+            if token not in terms:
+                terms.append(token[:40])
+            if len(terms) >= max_terms:
+                break
+    return terms[:max_terms]
+
+
+configure_retrieval_aux_tools(
+    pages=PAGES,
+    pages_by_doc=PAGES_BY_DOC,
+    is_heading_only_page=is_heading_only_page,
+    is_summary_like_page=is_summary_like_page,
+    is_low_value_evidence=is_low_value_evidence,
+    normalize_key_terms=normalize_key_terms,
+    summary_candidates_per_doc=INITIAL_SUMMARY_CANDIDATES_PER_DOC,
+    verbose_console=VERBOSE_CONSOLE,
+    summary_page_terms=SUMMARY_PAGE_TERMS,
+)
+
 
 
 INSUFFICIENT_SLOT_VALUE_TERMS = (
@@ -2211,10 +1274,12 @@ def normalize_audit_slots(audit: dict, option_state: dict) -> dict:
             target_doc_ids = [
                 doc_id for doc_id in item.get("target_doc_ids", []) if doc_id in (option_state.get("target_doc_ids") or [])
             ]
+            key_terms = normalize_key_terms(item.get("key_terms") or [], " ".join([slot, query]))
         else:
             slot = maybe_fix_mojibake(str(item or "")).strip()
             query = slot
             target_doc_ids = []
+            key_terms = normalize_key_terms([], slot)
         if not slot and not query:
             return
         key = f"{slot}|{query}|{'/'.join(target_doc_ids)}"
@@ -2226,6 +1291,7 @@ def normalize_audit_slots(audit: dict, option_state: dict) -> dict:
                 "slot": slot or query,
                 "target_doc_ids": target_doc_ids or list(option_state.get("target_doc_ids") or []),
                 "followup_query": query or slot,
+                "key_terms": key_terms,
             }
         )
 
@@ -2243,6 +1309,7 @@ def normalize_audit_slots(audit: dict, option_state: dict) -> dict:
                     "slot": item.get("slot") or "",
                     "target_doc_ids": item.get("target_doc_ids") or option_state.get("target_doc_ids") or [],
                     "followup_query": item.get("followup_query") or item.get("query") or item.get("slot") or "",
+                    "key_terms": item.get("key_terms") or [],
                 }
             )
             continue
@@ -2252,6 +1319,7 @@ def normalize_audit_slots(audit: dict, option_state: dict) -> dict:
                     "slot": item.get("slot") or "",
                     "target_doc_ids": item.get("target_doc_ids") or option_state.get("target_doc_ids") or [],
                     "followup_query": item.get("followup_query") or item.get("query") or item.get("slot") or "",
+                    "key_terms": item.get("key_terms") or [],
                 }
             )
             continue
@@ -2261,6 +1329,7 @@ def normalize_audit_slots(audit: dict, option_state: dict) -> dict:
                     "slot": item.get("slot") or "",
                     "target_doc_ids": item.get("target_doc_ids") or option_state.get("target_doc_ids") or [],
                     "followup_query": item.get("followup_query") or item.get("query") or item.get("slot") or "",
+                    "key_terms": item.get("key_terms") or [],
                 }
             )
             continue
@@ -2345,115 +1414,6 @@ def filled_slot_is_bare_relation_conclusion(item: dict) -> bool:
     return any(term in slot for term in relation_terms) and any(term == value or term in value for term in bare_values)
 
 
-def format_memory_slots(memory_slots: list[dict]) -> str:
-    if not memory_slots:
-        return "[]"
-    lines = []
-    for item in memory_slots:
-        evidence_ids = ", ".join(item.get("evidence_ids") or [])
-        lines.append(f"- {item.get('slot')}: {item.get('value')} [{evidence_ids}]")
-    return "\n".join(lines)
-
-
-def slot_key(text: str) -> str:
-    fixed = maybe_fix_mojibake(str(text or "")).lower()
-    return re.sub(r"[\s\W_]+", "", fixed)
-
-
-def normalize_required_slots(task: dict) -> list[str]:
-    raw_slots = task.get("required_slots") or task.get("slots") or []
-    slots: list[str] = []
-    for item in raw_slots:
-        slot = str(item.get("slot") if isinstance(item, dict) else item).strip()
-        if is_speculative_required_slot(slot):
-            continue
-        if slot and slot not in slots:
-            slots.append(slot[:80])
-    if not slots:
-        slots = [str(task.get("task") or task.get("query") or "子任务结论")[:80]]
-    return slots
-
-
-def is_speculative_required_slot(slot: str) -> bool:
-    compact = re.sub(r"\s+", "", maybe_fix_mojibake(str(slot or "")))
-    patterns = (
-        "是否有其他",
-        "是否还有",
-        "有无其他",
-        "有没有其他",
-        "其他退保扣费",
-        "其他扣费",
-        "额外扣费",
-        "额外费用",
-        "另有扣费",
-        "另有费用",
-        "是否存在其他",
-    )
-    return any(pattern in compact for pattern in patterns)
-
-
-def filled_required_slots(required_slots: list[str], memory_slots: list[dict]) -> tuple[list[str], list[str]]:
-    filled: list[str] = []
-    missing: list[str] = []
-    memory_keys = [
-        (
-            slot_key(item.get("slot", "")),
-            slot_key(item.get("value", "")),
-            set(re.findall(r"[\u4e00-\u9fffA-Za-z0-9%]+", maybe_fix_mojibake(str(item.get("slot", ""))))),
-        )
-        for item in memory_slots
-    ]
-    for required in required_slots:
-        req_key = slot_key(required)
-        req_terms = set(re.findall(r"[\u4e00-\u9fffA-Za-z0-9%]+", maybe_fix_mojibake(str(required))))
-        is_filled = False
-        for mem_key, value_key, mem_terms in memory_keys:
-            if not value_key:
-                continue
-            if req_key and (req_key in mem_key or mem_key in req_key):
-                is_filled = True
-                break
-            overlap = req_terms & mem_terms
-            if req_terms and len(overlap) >= max(1, min(2, len(req_terms))):
-                is_filled = True
-                break
-        if is_filled:
-            filled.append(required)
-        else:
-            missing.append(required)
-    return filled, missing
-
-
-def evidence_by_ids(evidence: list[dict], evidence_ids: list[str]) -> list[dict]:
-    if not evidence_ids:
-        return evidence
-    wanted = set(evidence_ids)
-    selected = [item for item in evidence if item.get("evidence_id") in wanted]
-    return selected or evidence
-
-
-def prioritize_evidence_for_review(option_state: dict) -> list[dict]:
-    evidence = option_state.get("evidence", []) or []
-    evidence_by_id = {item.get("evidence_id"): item for item in evidence}
-    ordered_ids: list[str] = []
-
-    def add_id(evidence_id: str) -> None:
-        if evidence_id and evidence_id in evidence_by_id and evidence_id not in ordered_ids:
-            ordered_ids.append(evidence_id)
-
-    for evidence_id in option_state.get("new_evidence_ids") or option_state.get("recent_evidence_ids") or []:
-        add_id(evidence_id)
-    for slot in option_state.get("memory_slots") or []:
-        for evidence_id in slot.get("evidence_ids") or []:
-            add_id(evidence_id)
-    audit = option_state.get("audit") or {}
-    for slot in audit.get("filled_slots") or []:
-        for evidence_id in slot.get("evidence_ids") or []:
-            add_id(evidence_id)
-    for item in evidence:
-        add_id(item.get("evidence_id"))
-    return [evidence_by_id[evidence_id] for evidence_id in ordered_ids]
-
 
 def use_task_reasoning_path(question: dict) -> bool:
     question_type = str(question.get("type") or "").strip()
@@ -2464,75 +1424,6 @@ def use_task_reasoning_path(question: dict) -> bool:
         return True
     return False
 
-
-def select_judge_evidence(option_state: dict) -> list[dict]:
-    audit = option_state.get("audit") or {}
-    selected_ids: list[str] = []
-    for evidence_id in option_state.get("new_evidence_ids") or option_state.get("recent_evidence_ids") or []:
-        if evidence_id not in selected_ids:
-            selected_ids.append(evidence_id)
-    for slot in option_state.get("memory_slots") or []:
-        for evidence_id in slot.get("evidence_ids") or []:
-            if evidence_id not in selected_ids:
-                selected_ids.append(evidence_id)
-    for slot in audit.get("filled_slots") or []:
-        for evidence_id in slot.get("evidence_ids") or []:
-            if evidence_id not in selected_ids:
-                selected_ids.append(evidence_id)
-    if not selected_ids:
-        return prioritize_evidence_for_review(option_state)
-
-    evidence_by_id = {item.get("evidence_id"): item for item in option_state.get("evidence", [])}
-    if (not audit.get("can_judge")) or (audit.get("missing_slots") or []):
-        for evidence_id in option_state.get("new_evidence_ids") or option_state.get("recent_evidence_ids") or []:
-            if evidence_id not in selected_ids:
-                selected_ids.append(evidence_id)
-        for item in prioritize_evidence_for_review(option_state)[:8]:
-            evidence_id = item.get("evidence_id")
-            if evidence_id and evidence_id not in selected_ids:
-                selected_ids.append(evidence_id)
-    selected = [evidence_by_id[evidence_id] for evidence_id in selected_ids if evidence_id in evidence_by_id]
-    return selected or prioritize_evidence_for_review(option_state)
-
-
-def evidence_has_toc_like_content(option_state: dict) -> bool:
-    for item in option_state.get("evidence", []) or []:
-        heading = compact_text(" > ".join(item.get("heading_path") or []))
-        text = compact_text(item.get("text", ""))[:1000]
-        if any(term in heading + text for term in ("目录", "图表目录", "图 ", "图:", "图：", "表 ", "表:", "表：")):
-            return True
-    return False
-
-
-def missing_slots_metric_like(missing_slots: list) -> bool:
-    terms = (
-        "年",
-        "%",
-        "同比",
-        "增速",
-        "增长",
-        "比例",
-        "占比",
-        "贡献",
-        "金额",
-        "规模",
-        "排名",
-        "市场份额",
-        "剪刀差",
-        "收入",
-        "利润",
-        "表",
-        "图",
-    )
-    for item in missing_slots or []:
-        if isinstance(item, dict):
-            text = " ".join(str(item.get(key) or "") for key in ("slot", "followup_query", "query"))
-        else:
-            text = str(item)
-        text = maybe_fix_mojibake(text)
-        if any(term in text for term in terms):
-            return True
-    return False
 
 
 def should_toc_repair(state: AgentState) -> bool:
@@ -2574,324 +1465,17 @@ def tried_section_summaries(option_state: dict, max_items: int = 8) -> list[dict
     return summaries
 
 
-def compact_toc_for_docs(doc_ids: list[str], max_lines_per_doc: int = 120) -> str:
-    chunks: list[str] = []
-    for doc_id in doc_ids:
-        text = compact_doc_tree_text(doc_id, max_lines=max_lines_per_doc)
-        if not text:
-            headings = doc_section_catalog(doc_id, max_sections=max_lines_per_doc)
-            text = "\n".join(f"- {heading}" for heading in headings)
-        if text:
-            chunks.append(f"## {doc_id}\n{text}")
-    return "\n\n".join(chunks)
 
-
-def build_toc_repair_prompt(state: AgentState) -> tuple[str, str]:
-    option = state["current_option"]
-    option_state = state["option_states"][option]
-    system = (
-        "你是目录补证Agent。当前普通检索证据不足，你需要根据题干、当前选项、缺失槽位和文档目录，"
-        "选择最可能包含答案的章节、图或表。只输出JSON。"
-        "可以从全部候选文档中补选文档，不要局限于之前router选中的文档。"
-        "每个缺失事实优先选择最具体的图表标题或章节标题。"
-    )
-    recent = []
-    for item in prioritize_evidence_for_review(option_state)[:6]:
-        recent.append(
-            {
-                "evidence_id": item.get("evidence_id"),
-                "doc_id": item.get("doc_id"),
-                "heading": " > ".join(item.get("heading_path") or []),
-                "preview": compact_text(item.get("text", ""))[:160],
-            }
+def get_retrieval_tools() -> RetrievalTools:
+    global RETRIEVAL_TOOLS
+    if RETRIEVAL_TOOLS is None:
+        RETRIEVAL_TOOLS = RetrievalTools(
+            section_search_fn=retrieve_one_doc_by_sections,
+            toc_hint_fn=retrieve_by_toc_hint,
+            toc_text_fn=compact_toc_for_docs,
         )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-当前选项：{option}. {option_claim(state)}
+    return RETRIEVAL_TOOLS
 
-缺失槽位：
-{json.dumps(option_state.get("audit", {}).get("missing_slots") or [], ensure_ascii=False)}
-
-已有证据摘要：
-{json.dumps(recent, ensure_ascii=False, indent=2)}
-
-已尝试但仍未补齐缺失槽位的章节：
-{json.dumps(tried_section_summaries(option_state), ensure_ascii=False, indent=2)}
-
-候选文档目录：
-{compact_toc_for_docs(state.get("doc_ids") or [])}
-
-请输出：
-{{
-  "section_queries": [
-    {{"doc_id": "doc_id", "section_hint": "目录中的章节/图/表标题", "query": "进入该章节后用于核验证据的短关键词"}}
-  ],
-  "reason": "为什么这些章节能补齐缺失槽位"
-}}
-最多输出3个section_queries。doc_id必须来自候选文档。section_hint应尽量原样复制目录标题。
-如果已尝试章节只命中相近但不直接回答的内容，必须改选同一文档内其他更相关章节、相邻条款或上级目录下的其他子条款。
-"""
-    return system, user
-
-
-def page_matches_hint(page: dict, hint: str) -> bool:
-    key = normalize_heading_key(hint)
-    if not key:
-        return False
-    haystacks = [
-        " > ".join(page.get("heading_path") or []),
-        page.get("title", ""),
-        page.get("index_text", ""),
-        page.get("text", ""),
-    ]
-    for text in haystacks:
-        text_key = normalize_heading_key(str(text or "")[:5000])
-        if key and text_key and (key in text_key or text_key in key):
-            return True
-    return False
-
-
-def section_matches_hint(section: dict, hint: str) -> bool:
-    key = normalize_heading_key(hint)
-    if not key:
-        return False
-    candidates = [
-        section_title(section),
-        " > ".join(section.get("heading_path") or []),
-        section.get("preview", ""),
-    ]
-    for text in candidates:
-        text_key = normalize_heading_key(str(text or "")[:3000])
-        if key and text_key and (key in text_key or text_key in key):
-            return True
-    return False
-
-
-def retrieve_by_toc_hint(doc_id: str, section_hint: str, query: str, max_items: int = 3) -> list[dict]:
-    evidence: list[dict] = []
-    selected_sections = [
-        section for section in DOC_SECTIONS_BY_DOC.get(doc_id, []) if section_matches_hint(section, section_hint)
-    ][:2]
-    for section in selected_sections:
-        section_id = str(section.get("section_id") or "")
-        section_name = section_title(section)
-        if any(term in compact_text(section_name) for term in ("内容目录", "图表目录")):
-            continue
-        section_evidence = section_pages_as_evidence_ranked(
-            section,
-            query,
-            "toc_repair",
-            [section_id],
-            [section_name],
-            max_pages=max_items,
-        )
-        if not section_evidence:
-            title_evidence = section_title_as_evidence(
-                section,
-                "toc_repair_title",
-                [section_id],
-                [section_name],
-            )
-            if title_evidence:
-                section_evidence.append(title_evidence)
-        evidence.extend(section_evidence)
-    if len(evidence) >= max_items:
-        return evidence[:max_items]
-
-    seen = {item.get("evidence_id") for item in evidence}
-    for page in PAGES_BY_DOC.get(doc_id, []):
-        if len(evidence) >= max_items:
-            break
-        if page.get("page_id") in seen or not page_matches_hint(page, section_hint):
-            continue
-        item = page_to_evidence(0.0, page, "toc_repair_hint")
-        item["selected_sections"] = [section_hint]
-        evidence.append(item)
-        seen.add(page.get("page_id"))
-    if evidence:
-        return evidence[:max_items]
-
-    fallback_query = " ".join(part for part in [section_hint, query] if part)
-    return retrieve_one_doc(fallback_query, doc_id, max_items, "toc_repair_bm25")
-
-
-def load_sparkai_api_key() -> str:
-    api_key = os.getenv(SPARKAI_API_KEY_ENV)
-    if api_key:
-        return api_key.strip()
-    key_file = Path(SPARKAI_API_KEY_FILE)
-    if key_file.exists():
-        return key_file.read_text(encoding="utf-8").strip()
-    raise RuntimeError(f"Set {SPARKAI_API_KEY_ENV} or create {SPARKAI_API_KEY_FILE}.")
-
-
-def extract_json_object(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text).strip()
-        text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise ValueError(f"No JSON object found: {text[:300]}")
-    return json.loads(match.group(0))
-
-
-def call_qwen_json(system_prompt: str, user_prompt: str) -> tuple[dict, dict[str, int]]:
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("Missing dependency: openai. Run `pip install openai`.") from exc
-
-    api_key = load_sparkai_api_key()
-    if VERBOSE_CONSOLE:
-        print(f"[spark request] model={QWEN_MODEL} chars={len(system_prompt) + len(user_prompt)}", flush=True)
-    client = OpenAI(api_key=api_key, base_url=SPARKAI_BASE_URL)
-    last_error: Exception | None = None
-    for attempt in range(1, REQUEST_RETRY_TIMES + 1):
-        try:
-            response = client.chat.completions.create(
-                model=QWEN_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            break
-        except Exception as exc:
-            last_error = exc
-            if VERBOSE_CONSOLE:
-                print(f"[spark request error] attempt={attempt}/{REQUEST_RETRY_TIMES} error={exc}", flush=True)
-            if attempt < REQUEST_RETRY_TIMES:
-                time.sleep(2 * attempt)
-    else:
-        raise RuntimeError(f"SparkAI request failed after {REQUEST_RETRY_TIMES} attempts: {last_error}") from last_error
-
-    usage = getattr(response, "usage", None) or {}
-    if VERBOSE_CONSOLE:
-        print(f"[spark response] total_tokens={getattr(usage, 'total_tokens', 0) if not isinstance(usage, dict) else usage.get('total_tokens', 0)}", flush=True)
-    content = response.choices[0].message.content or ""
-    usage_dict = usage if isinstance(usage, dict) else {
-        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
-    }
-    return extract_json_object(content), {
-        "prompt_tokens": int(usage_dict.get("prompt_tokens") or 0),
-        "completion_tokens": int(usage_dict.get("completion_tokens") or 0),
-        "total_tokens": int(usage_dict.get("total_tokens") or 0),
-    }
-
-
-def doc_aliases(doc_ids: list[str]) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    names = ["第一份文档", "第二份文档", "第三份文档", "第四份文档"]
-    for idx, doc_id in enumerate(doc_ids):
-        aliases[doc_id] = names[idx] if idx < len(names) else f"第{idx + 1}份文档"
-    return aliases
-
-
-def doc_profile_text(doc_id: str, max_chars: int = 420) -> str:
-    parts: list[str] = []
-    tree_doc = TREE_DOC_BY_ID.get(doc_id) or {}
-    for key in ("title", "doc_title", "source_path"):
-        value = tree_doc.get(key)
-        if value:
-            parts.append(Path(str(value)).stem if key == "source_path" else str(value))
-    for page in PAGES_BY_DOC.get(doc_id, [])[:3]:
-        title = str(page.get("title") or "")
-        heading = " > ".join(page.get("heading_path") or [])
-        text = str(page.get("text") or "")[:180]
-        parts.extend([title, heading, text])
-    compact = compact_text(" ".join(part for part in parts if part))
-    return compact[:max_chars]
-
-
-def doc_profile_lines(doc_ids: list[str]) -> str:
-    lines: list[str] = []
-    for doc_id in doc_ids:
-        profile = doc_profile_text(doc_id, max_chars=260)
-        lines.append(f"- {doc_id}: {profile}")
-    return "\n".join(lines)
-
-
-def is_doc_hint_token(token: str) -> bool:
-    token = str(token or "").strip()
-    if not token:
-        return False
-    if re.fullmatch(r"(?:19|20)\d{2}(?:年)?", token):
-        return False
-    if re.fullmatch(r"[\d.%-]+", token):
-        return False
-    if len(token) <= 1:
-        return False
-    if re.fullmatch(r"[a-z]+", token) and len(token) < 4:
-        return False
-    return bool(re.search(r"[\u4e00-\u9fffA-Za-z]", token))
-
-
-def is_doc_hint_phrase(phrase_key: str) -> bool:
-    if not phrase_key or len(phrase_key) < 4:
-        return False
-    if re.fullmatch(r"(?:19|20)\d{2}(?:年)?(?:至|到|-)?(?:19|20)?\d{0,4}(?:年)?", phrase_key):
-        return False
-    if re.fullmatch(r"[\d.%-]+", phrase_key):
-        return False
-    return len(re.findall(r"[\u4e00-\u9fff]", phrase_key)) >= 2
-
-
-def doc_hint_scores(claim: str, doc_ids: list[str]) -> list[tuple[float, str, list[str]]]:
-    claim_text = compact_text(claim)
-    claim_tokens = {token for token in tokenize(claim_text) if is_doc_hint_token(token)}
-    if not claim_tokens:
-        return []
-    claim_key = normalize_heading_key(claim_text)
-    scored: list[tuple[float, str, list[str]]] = []
-    for doc_id in doc_ids:
-        profile = doc_profile_text(doc_id, max_chars=900)
-        profile_tokens = {token for token in tokenize(profile) if is_doc_hint_token(token)}
-        overlap = sorted(claim_tokens & profile_tokens, key=lambda item: (-len(item), item))[:12]
-        if not overlap:
-            continue
-        score = 0.0
-        for token in overlap:
-            score += 2.5 if len(token) >= 4 else 1.0
-        normalized_profile = normalize_heading_key(profile)
-        for phrase in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{4,}", claim_text):
-            phrase_key = normalize_heading_key(phrase)
-            if is_doc_hint_phrase(phrase_key) and phrase_key in normalized_profile:
-                score += min(10.0, len(phrase_key) / 2)
-        phrase_hits: list[str] = []
-        for size in range(12, 3, -1):
-            for start in range(0, max(0, len(claim_key) - size + 1)):
-                phrase_key = claim_key[start : start + size]
-                if is_doc_hint_phrase(phrase_key) and phrase_key in normalized_profile:
-                    if phrase_key not in phrase_hits:
-                        phrase_hits.append(phrase_key)
-                if len(phrase_hits) >= 3:
-                    break
-            if len(phrase_hits) >= 3:
-                break
-        for phrase_key in phrase_hits:
-            score += min(8.0, len(phrase_key) / 1.5)
-        scored.append((score, doc_id, overlap))
-    return sorted(scored, key=lambda item: item[0], reverse=True)
-
-
-def deterministic_doc_hints(state: AgentState, max_docs: int = 2) -> list[str]:
-    claim = option_claim(state)
-    scored = doc_hint_scores(claim, state.get("doc_ids") or [])
-    if not scored:
-        return []
-    best_score = scored[0][0]
-    if best_score < 8.0:
-        return []
-    selected: list[str] = []
-    for score, doc_id, _overlap in scored[:max_docs]:
-        if score >= 8.0 and score >= best_score * 0.55:
-            selected.append(doc_id)
-    return selected
 
 
 def option_claim(state: AgentState) -> str:
@@ -2902,160 +1486,235 @@ def option_claim(state: AgentState) -> str:
     return maybe_fix_mojibake(state["question"]["options"][option])
 
 
+UNIVERSAL_CLAIM_TERMS = ("都", "均", "全部", "所有", "每个", "各", "皆")
+
+
+
+configure_doc_routing(
+    pages_by_doc=PAGES_BY_DOC,
+    tree_doc_by_id=TREE_DOC_BY_ID,
+    doc_tree_text_by_id=DOC_TREE_TEXT_BY_ID,
+    normalize_key_terms=normalize_key_terms,
+    option_claim=option_claim,
+    option_slot_query_text=option_slot_query_text,
+    doc_reroute_top_k=DOC_REROUTE_TOP_K,
+    doc_reroute_min_score=DOC_REROUTE_MIN_SCORE,
+    doc_reroute_margin=DOC_REROUTE_MARGIN,
+)
+
+def atomic_entities_for_state(state: AgentState) -> list[str]:
+    atomic = state.get("question", {}).get("enterprise_atomic") or {}
+    entities: list[str] = []
+    for value in atomic.get("entities") or []:
+        entity = maybe_fix_mojibake(str(value or "")).strip()
+        if len(entity) < 2:
+            continue
+        if entity not in entities:
+            entities.append(entity)
+    return entities
+
+
+def needs_entity_coverage_slots(state: AgentState) -> bool:
+    entities = atomic_entities_for_state(state)
+    if len(entities) < 2:
+        return False
+    claim = option_claim(state)
+    question = maybe_fix_mojibake(str(state.get("question", {}).get("question") or ""))
+    constraints = " ".join(
+        maybe_fix_mojibake(str(item or ""))
+        for item in (state.get("question", {}).get("enterprise_atomic") or {}).get("constraints") or []
+    )
+    surface = claim + "\n" + question + "\n" + constraints
+    if "需要覆盖" in constraints and "所有" in constraints:
+        return True
+    return any(term in surface for term in UNIVERSAL_CLAIM_TERMS)
+
+
+def slot_surface(slot: dict) -> str:
+    parts = [
+        str(slot.get("slot") or ""),
+        str(slot.get("expected") or ""),
+        " ".join(str(item) for item in slot.get("queries") or []),
+        " ".join(str(item) for item in slot.get("key_terms") or []),
+    ]
+    return maybe_fix_mojibake(" ".join(parts))
+
+
+def ensure_entity_coverage_slots(state: AgentState, slots: list[dict]) -> list[dict]:
+    if not needs_entity_coverage_slots(state):
+        return slots
+    entities = atomic_entities_for_state(state)
+    if not entities:
+        return slots
+    existing_surfaces = [slot_surface(slot) for slot in slots]
+    core_terms: list[str] = []
+    entity_keys = {compact_text(entity) for entity in entities}
+    for slot in slots:
+        for term in slot.get("key_terms") or []:
+            term = maybe_fix_mojibake(str(term or "")).strip()
+            if not term or compact_text(term) in entity_keys:
+                continue
+            if term not in core_terms:
+                core_terms.append(term)
+    if not core_terms:
+        core_terms = [
+            term for term in normalize_key_terms([], option_claim(state), max_terms=8)
+            if compact_text(term) not in entity_keys
+        ]
+    enhanced = list(slots)
+    for entity in entities:
+        entity_key = compact_text(entity)
+        if any(entity_key and entity_key in compact_text(surface) for surface in existing_surfaces):
+            continue
+        key_terms = normalize_key_terms([entity] + core_terms, " ".join([entity, option_claim(state)]), max_terms=8)
+        query = " ".join(key_terms[:8]) or entity
+        enhanced.append(
+            {
+                "slot": f"{entity}是否支持当前选项中的全称陈述"[:100],
+                "expected": "",
+                "queries": [query[:160]],
+                "key_terms": key_terms,
+            }
+        )
+        existing_surfaces.append(slot_surface(enhanced[-1]))
+    return enhanced
+
+
+CAUSE_SPLIT_RE = re.compile(r"(?:因为|由于|原因是|源于)([^。；;\n]+)")
+CAUSE_SEPARATOR_RE = re.compile(r"(?:且|并且|以及|同时|、|，|,)")
+CLAIM_FOCUS_RE = re.compile(r"(?:集中在|位于|面向|针对|依托|通过|基于)([^，,。；;因由且并及同时]+)")
+
+
+def claim_focus_for_reason(claim: str) -> str:
+    before_cause = re.split(r"因为|由于|原因是|源于", claim, maxsplit=1)[0]
+    matches = CLAIM_FOCUS_RE.findall(before_cause)
+    if not matches:
+        return ""
+    focus = maybe_fix_mojibake(matches[-1]).strip()
+    focus = re.sub(r"^(?:该|当地|相关|上述|这些)", "", focus).strip()
+    return focus[:40]
+
+
+def extract_claim_reason_parts(claim: str) -> list[str]:
+    claim = maybe_fix_mojibake(claim)
+    parts: list[str] = []
+    focus = claim_focus_for_reason(claim)
+    for match in CAUSE_SPLIT_RE.finditer(claim):
+        cause_text = match.group(1)
+        cause_text = re.split(r"[。；;\n]", cause_text, maxsplit=1)[0]
+        for raw_part in CAUSE_SEPARATOR_RE.split(cause_text):
+            part = maybe_fix_mojibake(raw_part).strip(" ：:，,。；; ")
+            if len(part) < 2:
+                continue
+            if focus and part.startswith(("该地区", "当地", "该地", "该区域")):
+                part = re.sub(r"^(?:该地区|当地|该地|该区域)", focus, part)
+            elif focus and not any(term in part for term in (focus, "地区", "市场", "区域")):
+                part = f"{focus}{part}"
+            if part and part not in parts:
+                parts.append(part[:80])
+    return parts[:4]
+
+
+def ensure_compound_reason_slots(state: AgentState, slots: list[dict]) -> list[dict]:
+    claim = option_claim(state)
+    reason_parts = extract_claim_reason_parts(claim)
+    if len(reason_parts) <= 1:
+        return slots
+    enhanced = list(slots)
+    existing_surfaces = [slot_surface(slot) for slot in enhanced]
+    for reason in reason_parts:
+        reason_key = compact_text(reason)
+        if any(reason_key and reason_key in compact_text(surface) for surface in existing_surfaces):
+            continue
+        key_terms = normalize_key_terms([], reason, max_terms=8)
+        query = " ".join(key_terms[:8]) or reason
+        enhanced.append(
+            {
+                "slot": f"当前选项原因是否有证据支持：{reason}"[:100],
+                "expected": "是",
+                "queries": [query[:160]],
+                "key_terms": key_terms,
+            }
+        )
+        existing_surfaces.append(slot_surface(enhanced[-1]))
+    return enhanced
+
+
 def build_doc_router_prompt(state: AgentState) -> tuple[str, str]:
     option = state["current_option"]
     doc_lines = "\n".join(f"- {alias}: {doc_id}" for doc_id, alias in state["doc_aliases"].items())
     profile_lines = doc_profile_lines(state.get("doc_ids") or [])
     hint_docs = deterministic_doc_hints(state)
-    system = (
-        "你是Doc Router。判断当前选项需要检索哪些参考文档。只输出JSON。"
-        "如果当前选项出现明确产品名、机构名、法规名，应优先选择文档摘要中直接包含该名称或高度相近名称的文档。"
+    return build_doc_router_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        option,
+        option_claim(state),
+        doc_lines,
+        profile_lines,
+        hint_docs,
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-当前选项：{option}. {option_claim(state)}
-
-可用文档：
-{doc_lines}
-
-文档摘要：
-{profile_lines}
-
-程序预匹配的候选文档（若非空，通常应优先考虑）：
-{json.dumps(hint_docs, ensure_ascii=False)}
-
-请输出：
-{{
-  "target_doc_ids": ["doc_id"],
-  "doc_reasons": {{"doc_id": "为什么需要该文档"}},
-  "reason": "简短说明"
-}}
-"""
-    return system, user
 
 
 def build_slot_planner_prompt(state: AgentState) -> tuple[str, str]:
     option = state["current_option"]
-    system = (
-        "你是选项槽位规划Agent。只根据题干和当前选项，拆出验证该选项所需的最小事实槽位，"
-        "并为每个槽位生成用于全文检索的短关键词。不要选择文档，不要判断选项对错。只输出JSON。"
+    entities = atomic_entities_for_state(state)
+    return build_slot_planner_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        state["question"].get("answer_format"),
+        option,
+        option_claim(state),
+        entities,
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-题型：{state["question"].get("answer_format")}
-当前选项：{option}. {option_claim(state)}
-
-请输出：
-{{
-  "slots": [
-    {{
-      "slot": "需要验证的事实",
-      "expected": "选项声称的值/关系，可为空",
-      "queries": ["语义检索短关键词", "数值/时间检索短关键词"]
-    }}
-  ]
-}}
-要求：
-1. 只拆当前选项本身需要验证的事实，不要加入无关背景。
-2. query 应包含对象、时间、指标；如果选项含数值或方向，至少一个 query 包含该数值或方向。
-3. 必须保留选项中的关键口径词，不要改成相近但不同的指标；例如“研发投入占营业收入比例”不要改成“研发费用 营业收入 比例”，“每股”不要改成“每10股”，“现金分红金额占归母净利润”不要改成“本次利润分配中占比”。
-4. query 不要写成长句，使用空格分隔关键词。
-5. 一般输出1-2个slots，每个slot最多2个queries。
-"""
-    return system, user
 
 
 def build_audit_prompt(state: AgentState) -> tuple[str, str]:
     option = state["current_option"]
     option_state = state["option_states"][option]
-    system = (
-        "你是证据充分性审查Agent。判断当前证据是否足以验证当前选项；不足则给出缺失槽位和短检索词。"
-        "必须检查全部当前证据正文，即使标题看起来不相关；只要正文含有所需事实，就应填入filled_slots。"
-        "如果证据正文包含必要事实的同义表达、等价表达、方向性表达或可换算的单位表达，也必须抽取为filled_slots。"
-        "单位、期间、分母、统计口径必须一致或明确可换算；“每10股”和“每股”、“研发费用”和“研发投入”、“年度现金分红”和“年度+特别现金分红”不能直接视为同一口径。"
-        "如果原文同时给出组成项和合计项，必须按当前选项措辞对应的最小口径抽取；选项未写“合计/总额/含其他方式/特别”等词时，不要自行扩大为合计口径。"
-        "例如“同比下降18.97%”可以支持“增速=-18.97%”，“同比增长14%”可以支持“增速=14%”。"
-        "filled_slots中的value必须来自证据原文、题干已知事实或基于证据中数字的明确计算；禁止把当前选项声称的数值直接当作已确认事实。"
-        "你必须先在内部明确验证当前选项所需的最小事实集合；只有这些事实都能由题干、已确认事实或当前证据支持时，can_judge才能为true。"
-        "只要任一必要事实缺失，就必须把该事实写入missing_slots，并设置can_judge=false。"
-        "filled_slots禁止写半截结论或待计算结论；value中不得出现问号、未知、未直接给出、需计算、可反推、已比较等不完整表述。"
-        "比较/比例类选项必须拿到双方对象的可比较数值或可直接支持的原文比例，缺任一方都必须进入missing_slots。"
-        "禁止用常识、估算、行业经验、选项倾向、排除法或未经证据支持的假设来补足缺失事实。"
-        "只输出JSON，且只能使用can_judge、filled_slots、missing_slots三个顶层字段。"
+    return build_audit_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        option,
+        option_claim(state),
+        option_state.get("target_doc_ids", []),
+        json.dumps(option_state.get("slots", []), ensure_ascii=False, indent=2),
+        format_memory_slots(option_state.get("memory_slots", [])),
+        format_memory_slots(option_state.get("evidence_facts", [])),
+        format_evidence(prioritize_evidence_for_review(option_state), max_chars=3600),
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-当前选项：{option}. {option_claim(state)}
-目标文档：{json.dumps(option_state.get("target_doc_ids", []), ensure_ascii=False)}
-
-待验证槽位：
-{json.dumps(option_state.get("slots", []), ensure_ascii=False, indent=2)}
-
-已确认事实：
-{format_memory_slots(option_state.get("memory_slots", []))}
-
-当前证据：
-{format_evidence(prioritize_evidence_for_review(option_state))}
-
-请输出：
-{{
-  "can_judge": true,
-  "filled_slots": [{{"slot": "事实槽位", "value": "事实值", "evidence_ids": ["证据ID"]}}],
-  "missing_slots": [{{"slot": "缺失槽位", "target_doc_ids": ["doc_id"], "followup_query": "短关键词"}}]
-}}
-不要输出matching_slots、matched_slots、matched_evidence等其他字段。若证据表述为“同比下降18.97%”，可将事实值写为“-18.97%（同比下降18.97%）”。
-如果当前选项需要比较、计算或判断多个对象，请分别检查每个对象的必要事实是否都有证据。缺少任何一项时，不要进入最终判断。
-如果当前选项需要计算占比、比例、比重、强度或率，分子和分母可以来自不同证据块；只要对象、年份、单位和口径一致，就应合并计算并填入filled_slots。
-如果只拿到了分子但没有分母，或只拿到一方比例但另一方比例未知，必须把缺少的分母/比例写入missing_slots，不得把“高于/低于/已比较”写入filled_slots。
-不要因为槽位名称和原文措辞不完全一致就判为缺失；如果原文能够等价支持该事实，应填入filled_slots并引用证据ID。
-如果选项中的数值没有出现在证据中，且不能由证据中的原始数字直接计算得到，必须判为缺失或填入证据中的实际值，不得照抄选项数值。
-如果证据只支持相近但不同口径的事实，应把正确口径写入filled_slots；若还缺少当前选项口径，则写入missing_slots继续检索。
-如果同一证据同时列出单项、特别项、其他方式、合计/总额等多种口径，应分别识别；当前选项没有明确要求合计时，优先抽取与选项文字最贴近的单项或原文同名项目。
-"""
-    return system, user
 
 
 def build_judge_prompt(state: AgentState) -> tuple[str, str]:
     option = state["current_option"]
     option_state = state["option_states"][option]
-    system = (
-        "你是做题Agent。只能基于给定证据判断当前选项陈述本身是否正确。"
-        "verdict=true表示当前选项陈述正确，verdict=false表示当前选项陈述错误或证据不足。只输出JSON。"
-        "已确认事实是审查Agent从证据中抽取的结构化线索；证据原文和基于同口径数字的可复算结果具有更高优先级。"
-        "如果已确认事实与证据原文、表格数字或你重新计算出的关系冲突，必须以证据原文和重新计算结果为准，并在reason中说明冲突。"
-        "如果已确认事实中已经包含某对象、指标、年份或数值，不要因为同一证据块还包含其他对象的信息而忽略或否定该事实。"
-        "如果当前选项包含高于、低于、多于、少于、大于、小于、快于、慢于、均为、是否等关系，必须先识别选项声称的关系，再用证据计算或抽取实际关系，最后检查二者是否一致。"
-        "如果证据显示的关系与选项声称的方向相反，verdict必须为false。"
-        "必须逐字核对单位和统计口径；每股、每10股、每手、每百元、含税/不含税、年度现金分红、特别现金分红、合计现金分红、研发费用、研发投入、占营业收入比例等口径不一致时，除非证据明确给出换算并换算后相同，否则verdict=false。"
-        "如果证据同时存在组成项和合计项，应先按当前选项文字选择最贴近的同名/同义项目；选项未明确写合计、总额、含其他方式、年度+特别等词时，不要主动改用合计项否定它。"
-        "如果已确认事实来自相近但不同口径的证据，不能据此判当前选项为true。"
-        "当题干和当前选项已经给出明确比较对象和指标时，不要改用其他年份、其他口径或额外背景事实推翻当前证据支持的同口径判断。"
+    return build_judge_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        state["question"].get("answer_format"),
+        option,
+        option_claim(state),
+        format_memory_slots(option_state.get("memory_slots", [])),
+        format_memory_slots(option_state.get("evidence_facts", [])),
+        json.dumps(option_state.get("audit", {}), ensure_ascii=False, indent=2),
+        format_evidence(select_judge_evidence(option_state), max_chars=6000),
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-题型：{state["question"].get("answer_format")}
-当前选项：{option}. {option_claim(state)}
 
-已确认事实：
-{format_memory_slots(option_state.get("memory_slots", []))}
 
-证据：
-{format_evidence(select_judge_evidence(option_state), max_chars=9000)}
-
-请输出：
-{{
-  "verdict": true,
-  "confidence": 0.0,
-  "reason": "简短依据",
-  "answer": "若当前选项正确则输出当前选项字母，否则输出空字符串；判断题可输出A或B"
-}}
-注意：不要把“已经完成判断”理解为verdict=true；verdict只表示当前选项陈述是否正确。若理由中认为当前选项错误，verdict必须为false。
-reason必须说明：选项声称的关系是什么、证据得到的关系是什么、二者是否一致。比较方向相反时不要输出当前选项字母。
-reason还必须说明单位和口径是否一致；例如证据为“每10股派息45.53元”而选项为“每股45.53元”时，应判为false。
-判断时可以先使用“已确认事实”中的对象-指标-数值作为线索，但遇到比较/比例/增长下降/是否高低这类关系时，必须用证据中的原始数值或明确同比值复核一遍。
-如果一个选项可由证据中的同名组成项直接支持，不要因为同一段证据还存在更大的合计项就判为错误；只有选项明确要求合计口径时才用合计项。
-"""
-    return system, user
+def enforce_judgment_missing_slot_guard(judgment: dict, option_state: dict, option: str, answer_format: str) -> dict:
+    audit = option_state.get("audit") or {}
+    missing = audit.get("missing_slots") or []
+    if not missing or judgment.get("verdict") is not True:
+        return judgment
+    judgment["verdict"] = False
+    judgment["confidence"] = min(float(judgment.get("confidence") or 0.0), 0.5)
+    judgment["missing_slots"] = missing
+    prior_reason = maybe_fix_mojibake(str(judgment.get("reason") or "")).strip()
+    judgment["reason"] = (
+        "审查结果仍存在未补齐槽位，不能用题干背景、无反例或推测替代证据判为支持。"
+        + (f" 原模型理由：{prior_reason}" if prior_reason else "")
+    )[:1200]
+    if answer_format == "tf":
+        judgment["answer"] = "F"
+    else:
+        judgment["answer"] = ""
+    return judgment
 
 
 def make_option_state(claim: str) -> dict:
@@ -3070,6 +1729,8 @@ def make_option_state(claim: str) -> dict:
         "evidence": [],
         "new_evidence_ids": [],
         "recent_evidence_ids": [],
+        "evidence_facts": [],
+        "evidence_read_batches": [],
         "memory_slots": [],
         "audit": {},
         "judgment": {},
@@ -3092,7 +1753,7 @@ def init_state(state: AgentState) -> AgentState:
             "doc_aliases": doc_aliases(question.get("doc_ids") or []),
             "option_order": order,
             "option_index": 0,
-            "current_option": order[0],
+            "current_option": order[0] if order else "",
             "option_states": options,
             "status": "running",
             "trace": [],
@@ -3124,12 +1785,18 @@ def slot_planner_node(state: AgentState) -> AgentState:
             query = maybe_fix_mojibake(str(query or "")).strip()
             if query and query not in queries:
                 queries.append(query[:160])
+        key_terms = normalize_key_terms(
+            item.get("key_terms") or [],
+            " ".join([slot, expected, " ".join(queries)]),
+            max_terms=8,
+        )
         if slot or expected or queries:
             slots.append(
                 {
                     "slot": slot[:100],
                     "expected": expected[:120],
                     "queries": queries[:2],
+                    "key_terms": key_terms,
                 }
             )
     if not slots:
@@ -3138,10 +1805,19 @@ def slot_planner_node(state: AgentState) -> AgentState:
                 "slot": option_claim(state)[:100],
                 "expected": "",
                 "queries": [option_claim(state)[:160]],
+                "key_terms": normalize_key_terms([], option_claim(state), max_terms=8),
             }
         ]
+    slots = ensure_entity_coverage_slots(state, slots)
+    slots = ensure_compound_reason_slots(state, slots)
+    reason_slot_count = len(extract_claim_reason_parts(option_claim(state)))
+    max_slots = 2
+    if needs_entity_coverage_slots(state):
+        max_slots = min(6, max(max_slots, len(atomic_entities_for_state(state))))
+    if reason_slot_count > 1:
+        max_slots = min(6, max(max_slots, 1 + reason_slot_count))
     option_state["slot_plan"] = plan
-    option_state["slots"] = slots[:2]
+    option_state["slots"] = slots[:max_slots]
     option_state["status"] = "slot_planned"
     add_trace(state, f"{option}: slot plan {len(option_state['slots'])}")
     if VERBOSE_CONSOLE:
@@ -3220,18 +1896,35 @@ def retrieve_initial_node(state: AgentState) -> AgentState:
         evidence = []
         for search in searches:
             evidence.extend(
-                retrieve_multi_doc(search["query"], search["target_doc_ids"], min(INITIAL_TOP_K, 2), "initial")
+                get_retrieval_tools()
+                .global_search(
+                    query=search["query"],
+                    doc_ids=search["target_doc_ids"],
+                    top_k_per_doc=min(INITIAL_TOP_K, 2),
+                    source="initial",
+                )["evidence"]
             )
     elif slot_queries:
         evidence = []
         for query in slot_queries[:4]:
             evidence.extend(
-                retrieve_multi_doc(query, target_doc_ids, min(INITIAL_TOP_K, 2), "initial")
+                get_retrieval_tools()
+                .global_search(
+                    query=query,
+                    doc_ids=target_doc_ids,
+                    top_k_per_doc=min(INITIAL_TOP_K, 2),
+                    source="initial",
+                )["evidence"]
             )
     else:
         query = f"{maybe_fix_mojibake(state['question']['question'])}\n{option}. {option_state['claim']}"
         retrieval_query = query
-        evidence = retrieve_multi_doc(query, target_doc_ids, INITIAL_TOP_K, "initial")
+        evidence = get_retrieval_tools().global_search(
+            query=query,
+            doc_ids=target_doc_ids,
+            top_k_per_doc=INITIAL_TOP_K,
+            source="initial",
+        )["evidence"]
     if (slot_queries or searches) and retrieval_query:
         evidence = merge_evidence(evidence, summary_candidate_evidence(target_doc_ids, retrieval_query))
         before_rerank_ids = [item["evidence_id"] for item in evidence]
@@ -3259,6 +1952,83 @@ def retrieve_initial_node(state: AgentState) -> AgentState:
     return state
 
 
+def build_evidence_read_prompt(state: AgentState) -> tuple[str, str]:
+    option = state["current_option"]
+    option_state = state["option_states"][option]
+    return build_evidence_read_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        option,
+        option_claim(state),
+        json.dumps(option_state.get("slots", []), ensure_ascii=False, indent=2),
+        format_memory_slots(option_state.get("memory_slots", [])),
+        format_evidence(current_evidence_for_read(option_state), max_chars=3600),
+    )
+
+
+def merge_evidence_facts(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    merged = list(existing or [])
+    seen = {
+        (
+            str(item.get("slot") or ""),
+            str(item.get("value") or ""),
+            ",".join(item.get("evidence_ids") or []),
+        )
+        for item in merged
+        if isinstance(item, dict)
+    }
+    for item in incoming or []:
+        if not isinstance(item, dict):
+            continue
+        slot = maybe_fix_mojibake(str(item.get("slot") or "")).strip()
+        value = maybe_fix_mojibake(str(item.get("value") or "")).strip()
+        evidence_ids = normalize_evidence_id_list(item.get("evidence_ids") or [])
+        if not slot or not value or not evidence_ids:
+            continue
+        compact = {
+            "slot": slot[:100],
+            "value": value[:220],
+            "coverage": str(item.get("coverage") or "partial")[:20],
+            "evidence_ids": evidence_ids[:5],
+        }
+        key = (compact["slot"], compact["value"], ",".join(compact["evidence_ids"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(compact)
+    return merged[-24:]
+
+
+def evidence_read_node(state: AgentState) -> AgentState:
+    option = state["current_option"]
+    option_state = state["option_states"][option]
+    batch_ids = normalize_evidence_id_list(option_state.get("new_evidence_ids") or option_state.get("recent_evidence_ids") or [])
+    if not batch_ids:
+        option_state["status"] = "evidence_read_skipped"
+        return state
+    batch_key = "|".join(batch_ids)
+    if batch_key in set(option_state.get("evidence_read_batches") or []):
+        option_state["status"] = "evidence_read_already_done"
+        return state
+    batches = list(option_state.get("evidence_read_batches") or [])
+    batches.append(batch_key)
+    option_state["evidence_read_batches"] = batches[-12:]
+    option_state["evidence_read_current_ids"] = batch_ids
+    if DRY_RUN_WITHOUT_LLM:
+        result = {"facts": []}
+    else:
+        system, user = build_evidence_read_prompt(state)
+        result, usage = call_qwen_json(system, user)
+        add_usage(state, usage)
+    facts = result.get("facts") or []
+    option_state["evidence_facts"] = merge_evidence_facts(option_state.get("evidence_facts", []), facts)
+    option_state["evidence_read_current_ids"] = []
+    option_state["status"] = "evidence_read"
+    add_trace(state, f"{option}: evidence read {len(facts)} facts")
+    if VERBOSE_CONSOLE:
+        print("[evidence facts]", json.dumps(option_state.get("evidence_facts", []), ensure_ascii=False, indent=2), flush=True)
+    return state
+
+
 def audit_node(state: AgentState) -> AgentState:
     option = state["current_option"]
     option_state = state["option_states"][option]
@@ -3278,7 +2048,7 @@ def audit_node(state: AgentState) -> AgentState:
     option_state["audit"] = audit
     option_state["memory_slots"] = merge_memory_slots(
         option_state.get("memory_slots", []),
-        filter_task_audit_slots(audit.get("filled_slots") or []),
+        merge_evidence_facts(option_state.get("evidence_facts", []), filter_task_audit_slots(audit.get("filled_slots") or [])),
     )
     option_state["new_evidence_ids"] = []
     option_state["round"] = option_state.get("round", 0) + 1
@@ -3291,11 +2061,119 @@ def audit_node(state: AgentState) -> AgentState:
     return state
 
 
+DEGREE_CLAIM_TERMS = ("主要", "集中", "重点", "核心", "首要", "唯一", "均", "都", "全部", "所有")
+PARALLEL_RELATION_TERMS = (
+    "两大",
+    "两个",
+    "多大",
+    "多个",
+    "多类",
+    "并列",
+    "之一",
+    "一是",
+    "二是",
+    "三是",
+    "同时",
+    "分别",
+)
+NEGATIVE_RELATION_TERMS = ("并非", "不是", "不属于", "不一致", "相反", "无法支持")
+INSUFFICIENT_EVIDENCE_TERMS = (
+    "未包含",
+    "未提及",
+    "未找到",
+    "没找到",
+    "没有找到",
+    "没有检索到",
+    "未检索到",
+    "证据不足",
+    "缺少证据",
+    "无法确定",
+    "无法判断",
+    "仅提及",
+)
+
+
+def same_slot_key(left: str, right: str) -> bool:
+    left_key = compact_text(left)
+    right_key = compact_text(right)
+    if not left_key or not right_key:
+        return False
+    return left_key in right_key or right_key in left_key
+
+
+def audit_has_decisive_contradiction(option_state: dict) -> bool:
+    audit = option_state.get("audit") or {}
+    missing_slots = audit.get("missing_slots") or []
+    filled_slots = list(audit.get("filled_slots") or [])
+    filled_slots.extend(option_state.get("memory_slots") or [])
+    filled_slots.extend(option_state.get("evidence_facts") or [])
+    if not missing_slots or not filled_slots:
+        return False
+    planned_slots = [
+        maybe_fix_mojibake(str(item.get("slot") or ""))
+        for item in option_state.get("slots") or []
+        if isinstance(item, dict)
+    ]
+    direct_negative_terms = (
+        "否",
+        "不成立",
+        "不支持",
+        "不符合",
+        "并非",
+        "不是",
+        "相反",
+        "无法支持",
+    )
+    for filled in filled_slots:
+        if not isinstance(filled, dict):
+            continue
+        filled_slot = maybe_fix_mojibake(str(filled.get("slot") or ""))
+        value = maybe_fix_mojibake(str(filled.get("value") or "")).strip()
+        if not filled_slot or not value:
+            continue
+        if planned_slots and not any(same_slot_key(filled_slot, planned) for planned in planned_slots):
+            continue
+        if any(term in value for term in INSUFFICIENT_EVIDENCE_TERMS):
+            continue
+        if value == "否" or any(term in value for term in direct_negative_terms[1:]):
+            return True
+    for missing in missing_slots:
+        if not isinstance(missing, dict):
+            continue
+        missing_slot = maybe_fix_mojibake(str(missing.get("slot") or ""))
+        if not missing_slot:
+            continue
+        for filled in filled_slots:
+            if not isinstance(filled, dict):
+                continue
+            filled_slot = maybe_fix_mojibake(str(filled.get("slot") or ""))
+            value = maybe_fix_mojibake(str(filled.get("value") or ""))
+            if not same_slot_key(missing_slot, filled_slot):
+                continue
+            if any(term in value for term in INSUFFICIENT_EVIDENCE_TERMS):
+                continue
+            if any(term in value for term in NEGATIVE_RELATION_TERMS):
+                return True
+            has_degree_claim = any(term in missing_slot for term in DEGREE_CLAIM_TERMS)
+            has_parallel_value = any(term in value for term in PARALLEL_RELATION_TERMS)
+            if has_degree_claim and has_parallel_value:
+                return True
+    return False
+
+
 def route_after_audit(state: AgentState) -> str:
+    option = state["current_option"]
     option_state = state["option_states"][state["current_option"]]
     missing = option_state.get("audit", {}).get("missing_slots") or []
     if not missing and option_state.get("status") == "ready_to_judge":
         return "judge"
+    if audit_has_decisive_contradiction(option_state):
+        option_state["early_judge_reason"] = "audit_filled_slot_contradicts_missing_core_claim"
+        add_trace(state, f"{option}: early judge on decisive contradiction")
+        return "judge"
+    if missing and has_doc_reroute_candidate(state):
+        add_trace(state, f"{option}: doc reroute before local repair")
+        return "retrieve_more"
     if should_review_original_after_subsearch(state):
         return "review_original_after_subsearch"
     if should_inner_focus(state):
@@ -3324,6 +2202,49 @@ def should_review_original_after_subsearch(state: AgentState) -> bool:
     return any(evidence_id in evidence_by_id for evidence_id in source_ids)
 
 
+def filter_review_original_source_ids(option_state: dict, source_ids: list[str]) -> list[str]:
+    source_ids = list(dict.fromkeys(source_ids))
+    if len(source_ids) <= REVIEW_ORIGINAL_MAX_SOURCE_IDS:
+        return source_ids
+    missing = option_state.get("audit", {}).get("missing_slots") or []
+    query = missing_query_text(missing)
+    key_terms: list[str] = []
+    for item in missing:
+        if isinstance(item, dict):
+            for term in normalize_key_terms(
+                item.get("key_terms") or [],
+                " ".join([str(item.get("slot") or ""), str(item.get("followup_query") or item.get("query") or "")]),
+                max_terms=8,
+            ):
+                if term not in key_terms:
+                    key_terms.append(term)
+    query_tokens = {token for token in tokenize(query) if len(token) >= 2}
+    evidence_by_id = {item.get("evidence_id"): item for item in option_state.get("evidence", []) or []}
+    remembered = remembered_evidence_ids(option_state)
+    scored: list[tuple[float, int, str]] = []
+    for idx, evidence_id in enumerate(source_ids):
+        item = evidence_by_id.get(evidence_id)
+        if not item:
+            continue
+        heading = maybe_fix_mojibake(" > ".join(item.get("heading_path") or []))
+        text = maybe_fix_mojibake(compact_html_text(str(item.get("text") or "")))
+        searchable = f"{heading}\n{text}"
+        score = 0.0
+        score += sum(4.0 for term in key_terms if term and term in searchable)
+        score += len(query_tokens & set(tokenize(searchable))) * 1.0
+        score += len(query_tokens & set(tokenize(heading))) * 1.5
+        if evidence_id in remembered:
+            score += 2.0
+        if re.search(r"(?:图|表)\s*[\d一二三四五六七八九十]+[：:]|\|.+\|", searchable):
+            score += 0.5
+        if score > 0:
+            scored.append((score, -idx, evidence_id))
+    if not scored:
+        return source_ids[:REVIEW_ORIGINAL_MAX_SOURCE_IDS]
+    scored.sort(reverse=True)
+    return [evidence_id for _score, _neg_idx, evidence_id in scored[:REVIEW_ORIGINAL_MAX_SOURCE_IDS]]
+
+
 def review_original_after_subsearch_node(state: AgentState) -> AgentState:
     option = state["current_option"]
     option_state = state["option_states"][option]
@@ -3334,16 +2255,23 @@ def review_original_after_subsearch_node(state: AgentState) -> AgentState:
         for evidence_id in local_subsearch.get("source_evidence_ids") or []
         if evidence_id in evidence_by_id
     ]
-    batch_key = "|".join(source_ids)
+    original_source_count = len(source_ids)
+    original_batch_key = "|".join(source_ids)
+    source_ids = filter_review_original_source_ids(option_state, source_ids)
     batches = list(option_state.get("original_review_after_subsearch_batches") or [])
-    if batch_key and batch_key not in batches:
-        batches.append(batch_key)
+    if original_batch_key and original_batch_key not in batches:
+        batches.append(original_batch_key)
     option_state["original_review_after_subsearch_batches"] = batches
     option_state["original_review_after_subsearch_used"] = True
+    option_state["review_original_filter"] = {
+        "before_count": original_source_count,
+        "after_count": len(source_ids),
+        "source_evidence_ids": source_ids,
+    }
     option_state["new_evidence_ids"] = source_ids
     option_state["recent_evidence_ids"] = source_ids
     option_state["status"] = "review_original_after_subsearch"
-    add_trace(state, f"{option}: review original after subsearch {len(source_ids)}")
+    add_trace(state, f"{option}: review original after subsearch {len(source_ids)}/{original_source_count}")
     if VERBOSE_CONSOLE and source_ids:
         print("[review original after subsearch]", source_ids, flush=True)
     return state
@@ -3357,7 +2285,7 @@ def should_inner_focus(state: AgentState) -> bool:
         return False
     if option_state.get("inner_focus_used"):
         return False
-    return any(len(compact_text(item.get("text", ""))) > INNER_FOCUS_MIN_CHARS for item in option_state.get("evidence", []))
+    return any(len(compact_text(item.get("text", ""))) > INNER_FOCUS_MIN_CHARS for item in prioritize_evidence_for_review(option_state))
 
 
 def focus_evidence_node(state: AgentState) -> AgentState:
@@ -3413,33 +2341,13 @@ def build_evidence_extract_prompt(state: AgentState) -> tuple[str, str]:
                 "text": text[:9000],
             }
         )
-    system = (
-        "你是块内证据摘录Agent。你只能从给定证据块原文中摘录能验证当前选项的句子、短段落或表格行。"
-        "不要解释、不要改写、不要推理、不要补充原文没有的内容。只输出JSON。"
+    return build_evidence_extract_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        option,
+        option_claim(state),
+        json.dumps(option_state.get("audit", {}).get("missing_slots") or [], ensure_ascii=False),
+        json.dumps(evidence_items, ensure_ascii=False, indent=2),
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-当前选项：{option}. {option_claim(state)}
-
-上一轮缺失槽位：
-{json.dumps(option_state.get("audit", {}).get("missing_slots") or [], ensure_ascii=False)}
-
-证据块：
-{json.dumps(evidence_items, ensure_ascii=False, indent=2)}
-
-请输出：
-{{
-  "extractions": [
-    {{"source_evidence_id": "原证据ID", "text": "从原文逐字摘录的相关句子/表格行，最多500字", "reason": "对应哪个事实槽位"}}
-  ]
-}}
-要求：
-1. text 必须是原文连续片段或表格的原始行组合，不得改写。
-2. 优先摘录同时包含选项中的实体、年份、指标、数值的句子。
-3. 正文中已有精确数值时，优先摘正文句子；正文没有时再摘表格行。
-4. 最多输出4条；如果没有相关原文，输出空数组。
-"""
-    return system, user
 
 
 def evidence_extract_node(state: AgentState) -> AgentState:
@@ -3486,7 +2394,7 @@ def evidence_extract_node(state: AgentState) -> AgentState:
         )
     if extracted:
         option_state["evidence"] = merge_evidence(option_state.get("evidence", []), extracted)
-        option_state["new_evidence_ids"] = [item["evidence_id"] for item in extracted] + original_new_ids
+        option_state["new_evidence_ids"] = [item["evidence_id"] for item in extracted]
         option_state["recent_evidence_ids"] = option_state["new_evidence_ids"]
         option_state["evidence_extract"] = {
             "source_evidence_ids": original_new_ids,
@@ -3509,12 +2417,19 @@ def retrieve_more_node(state: AgentState) -> AgentState:
     for item in missing:
         if isinstance(item, dict):
             query = item.get("followup_query") or item.get("query") or item.get("slot") or ""
+            slot_text = maybe_fix_mojibake(str(item.get("slot") or query)).strip()
+            key_terms = normalize_key_terms(item.get("key_terms") or [], " ".join([slot_text, str(query)]), max_terms=10)
             target_doc_ids = [doc_id for doc_id in item.get("target_doc_ids", []) if doc_id in state["doc_ids"]]
         else:
             query = str(item)
+            slot_text = query
+            key_terms = normalize_key_terms([], query, max_terms=10)
             target_doc_ids = []
         if not target_doc_ids:
             target_doc_ids = option_state.get("target_doc_ids") or state["doc_ids"]
+        added_doc_ids = reroute_docs_for_missing_slot(state, item, option_state)
+        if added_doc_ids:
+            target_doc_ids = list(dict.fromkeys(list(target_doc_ids) + added_doc_ids))
         if not query:
             continue
         followup_queries = [query]
@@ -3526,11 +2441,38 @@ def retrieve_more_node(state: AgentState) -> AgentState:
             source = "followup" if idx == 0 else "followup_computed_part"
             evidence = merge_evidence(
                 evidence,
-                retrieve_multi_doc(followup_query, target_doc_ids, FOLLOWUP_TOP_K, source),
+                get_retrieval_tools().global_search(
+                    query=followup_query,
+                    doc_ids=target_doc_ids,
+                    top_k_per_doc=FOLLOWUP_TOP_K,
+                    source=source,
+                )["evidence"],
             )
+        coverage_evidence = retrieve_by_key_term_coverage(target_doc_ids, key_terms, "followup_key_coverage")
+        if coverage_evidence:
+            evidence = merge_evidence(evidence, coverage_evidence)
         ratio_hint_evidence = build_computed_ratio_hint_evidence(option_state, query, evidence)
         if ratio_hint_evidence:
             evidence = merge_evidence(ratio_hint_evidence, evidence)
+        before_rerank_ids = [item["evidence_id"] for item in evidence]
+        max_followup_items = max(FOLLOWUP_TOP_K + 2, min(8, len(target_doc_ids) * (FOLLOWUP_TOP_K + 1)))
+        evidence = rerank_evidence_for_slot(
+            evidence,
+            slot_text,
+            query,
+            key_terms=key_terms,
+            max_items=max_followup_items,
+        )
+        option_state.setdefault("followup_rerank", []).append(
+            {
+                "slot": slot_text[:160],
+                "query": str(query)[:160],
+                "key_terms": key_terms,
+                "coverage_ids": [item["evidence_id"] for item in coverage_evidence],
+                "before_ids": before_rerank_ids,
+                "after_ids": [item["evidence_id"] for item in evidence],
+            }
+        )
         option_state["evidence"] = merge_evidence(option_state["evidence"], evidence)
         option_state["new_evidence_ids"] = list(
             dict.fromkeys(option_state.get("new_evidence_ids", []) + [item["evidence_id"] for item in evidence])
@@ -3539,9 +2481,12 @@ def retrieve_more_node(state: AgentState) -> AgentState:
         apply_local_subsearch_to_new_evidence(state, "followup")
         if VERBOSE_CONSOLE:
             print("[followup query]", query, flush=True)
+            print("[followup key_terms]", json.dumps(key_terms, ensure_ascii=False), flush=True)
             if len(followup_queries) > 1:
                 print("[followup computed queries]", json.dumps(followup_queries[1:], ensure_ascii=False), flush=True)
             print("[followup target_doc_ids]", target_doc_ids, flush=True)
+            if added_doc_ids:
+                print("[doc reroute added]", added_doc_ids, flush=True)
             print_evidence_preview(evidence)
     option_state["status"] = "retrieved_more"
     add_trace(state, f"{option}: followup retrieve {len(missing)} missing slots")
@@ -3559,6 +2504,15 @@ def toc_repair_node(state: AgentState) -> AgentState:
         add_usage(state, usage)
     section_queries = plan.get("section_queries") or []
     evidence: list[dict] = []
+    audit_key_terms: list[str] = []
+    for missing_item in option_state.get("audit", {}).get("missing_slots") or []:
+        if isinstance(missing_item, dict):
+            for term in normalize_key_terms(
+                missing_item.get("key_terms") or [],
+                " ".join([str(missing_item.get("slot") or ""), str(missing_item.get("followup_query") or "")]),
+            ):
+                if term not in audit_key_terms:
+                    audit_key_terms.append(term)
     for item in section_queries[:3]:
         if not isinstance(item, dict):
             continue
@@ -3569,7 +2523,37 @@ def toc_repair_node(state: AgentState) -> AgentState:
         query = maybe_fix_mojibake(str(item.get("query") or section_hint).strip())
         if not section_hint and not query:
             continue
-        evidence.extend(retrieve_by_toc_hint(doc_id, section_hint or query, query, max_items=3))
+        section_evidence = get_retrieval_tools().section_search(
+            query=query,
+            doc_id=doc_id,
+            top_k=3,
+            source="toc_repair",
+            section_hint=section_hint or query,
+        )["evidence"]
+        key_terms = normalize_key_terms(
+            item.get("key_terms") or audit_key_terms,
+            " ".join([section_hint, query]),
+            max_terms=10,
+        )
+        before_rerank_ids = [candidate["evidence_id"] for candidate in section_evidence]
+        section_evidence = rerank_evidence_for_slot(
+            section_evidence,
+            section_hint,
+            query,
+            key_terms=key_terms,
+            max_items=3,
+        )
+        option_state.setdefault("toc_rerank", []).append(
+            {
+                "doc_id": doc_id,
+                "section_hint": section_hint[:160],
+                "query": query[:160],
+                "key_terms": key_terms,
+                "before_ids": before_rerank_ids,
+                "after_ids": [candidate["evidence_id"] for candidate in section_evidence],
+            }
+        )
+        evidence.extend(section_evidence)
     option_state["evidence"] = merge_evidence(option_state.get("evidence", []), evidence)
     option_state["new_evidence_ids"] = [item["evidence_id"] for item in evidence]
     option_state["recent_evidence_ids"] = option_state["new_evidence_ids"]
@@ -3615,6 +2599,82 @@ def normalize_judgment(judgment: dict, option: str, answer_format: str) -> dict:
     return judgment
 
 
+REASON_SUPPORT_TERMS = (
+    "与选项陈述一致",
+    "与选项一致",
+    "选项成立",
+    "陈述成立",
+    "说法成立",
+    "能够支持",
+    "可以支持",
+    "支持该选项",
+    "支持选项",
+    "方向一致",
+    "口径一致",
+)
+
+REASON_REJECT_TERMS = (
+    "与选项陈述不一致",
+    "与选项不一致",
+    "选项不成立",
+    "陈述不成立",
+    "说法不成立",
+    "选项错误",
+    "陈述错误",
+    "说法错误",
+    "不能支持",
+    "无法支持",
+    "不支持该选项",
+    "不支持选项",
+    "方向相反",
+    "口径不一致",
+    "证据不足",
+    "缺少证据",
+    "无法判断",
+)
+
+
+def infer_verdict_from_reason(reason: str) -> bool | None:
+    text = maybe_fix_mojibake(reason)
+    if not text:
+        return None
+    has_support = any(term in text for term in REASON_SUPPORT_TERMS)
+    has_reject = any(term in text for term in REASON_REJECT_TERMS)
+    if has_support and not has_reject:
+        return True
+    if has_reject and not has_support:
+        return False
+    return None
+
+
+def set_judgment_answer_from_verdict(judgment: dict, option: str, answer_format: str) -> dict:
+    if answer_format == "tf":
+        if judgment.get("verdict") is True:
+            judgment["answer"] = "T"
+        elif judgment.get("verdict") is False:
+            judgment["answer"] = "F"
+    else:
+        if judgment.get("verdict") is True:
+            judgment["answer"] = option
+        elif judgment.get("verdict") is False:
+            judgment["answer"] = ""
+    return judgment
+
+
+def enforce_judgment_reason_consistency(judgment: dict, option: str, answer_format: str) -> dict:
+    inferred = infer_verdict_from_reason(str(judgment.get("reason") or ""))
+    if inferred is None or judgment.get("verdict") is inferred:
+        return judgment
+    original = judgment.get("verdict")
+    judgment["verdict"] = inferred
+    judgment["confidence"] = min(float(judgment.get("confidence") or 0.0), 0.85)
+    judgment["reason_consistency_fix"] = {
+        "original_verdict": original,
+        "fixed_verdict": inferred,
+    }
+    return set_judgment_answer_from_verdict(judgment, option, answer_format)
+
+
 def judge_node(state: AgentState) -> AgentState:
     option = state["current_option"]
     option_state = state["option_states"][option]
@@ -3637,7 +2697,17 @@ def judge_node(state: AgentState) -> AgentState:
             add_usage(state, usage)
     finally:
         option_state["evidence"] = all_evidence
-    judgment = normalize_judgment(judgment, option, state["question"].get("answer_format", ""))
+    answer_format = state["question"].get("answer_format", "")
+    judgment = normalize_judgment(judgment, option, answer_format)
+    judgment = enforce_judgment_reason_consistency(judgment, option, answer_format)
+    if judgment.get("reason_consistency_fix"):
+        add_trace(state, f"{option}: judge reason/verdict consistency fixed")
+    judgment = enforce_judgment_missing_slot_guard(
+        judgment,
+        option_state,
+        option,
+        answer_format,
+    )
     option_state["judgment"] = judgment
     option_state["status"] = judgment.get("status", "done")
     add_trace(state, f"{option}: judge verdict={judgment.get('verdict')}")
@@ -3869,42 +2939,12 @@ def rewrite_followup_queries(
 def build_task_reasoning_plan_prompt(state: AgentState) -> tuple[str, str]:
     doc_lines = "\n".join(f"- {alias}: {doc_id}" for doc_id, alias in state["doc_aliases"].items())
     valid_doc_ids = [str(doc_id) for doc_id in state.get("doc_ids", [])]
-    system = (
-        "你是推理/计算题任务拆解Agent。先整体分析题目和选项，再把整题拆成若干独立子任务。"
-        "每个任务通常对应一个产品、对象、年份、指标或金额。"
-        "每个任务必须给出题干已知事实known_facts，以及需要检索的事实槽位search_slots。"
-        "任务还必须给出task_type：retrieve表示需要检索文档，summarize表示只汇总前面任务结果、不再检索文档。"
-        "target_doc_ids必须使用真实doc_id，只能从题干给出的doc_ids中选择；不要输出doc_id_1、doc1、文档1等别名。"
-        "如果任务只涉及一个产品，target_doc_ids通常只填该产品对应的一个文档。"
-        "比较/排序汇总任务一般不需要检索文档，可不拆成检索任务。"
-        "search query必须是3到8个关键词。只输出JSON。"
+    return build_task_reasoning_plan_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        reasoning_options_text(state["question"]),
+        doc_lines,
+        valid_doc_ids,
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-
-选项：
-{reasoning_options_text(state["question"])}
-
-可用文档：
-{doc_lines}
-
-合法target_doc_ids只能取这些字符串：
-{json.dumps(valid_doc_ids, ensure_ascii=False)}
-
-请输出：
-{{
-  "tasks": [
-    {{
-      "task": "任务名",
-      "task_type": "retrieve",
-      "target_doc_ids": ["doc_id"],
-      "known_facts": [{{"slot": "题干已知事实", "value": "数值或条件"}}],
-      "search_slots": [{{"slot": "需要检索的条款事实", "query": "短关键词"}}]
-    }}
-  ]
-}}
-"""
-    return system, user
 
 
 def resolve_plan_doc_ids(raw_doc_ids: list, default_doc_ids: list[str], doc_aliases: dict[str, str] | None = None) -> list[str]:
@@ -4007,127 +3047,162 @@ def build_task_reasoning_audit_prompt(
     evidence: list[dict],
     evidence_notes: list[dict] | None = None,
 ) -> tuple[str, str]:
-    system = (
-        "你是单任务证据审查Agent。只判断当前任务是否已经具备计算/判断所需事实。"
-        "题干已知事实可以直接使用；证据笔记和当前证据原文用于补齐条款规则、公式、比例、定义。"
-        "证据笔记是从原文证据块中抽取的关键信息，必须保留其source_evidence_id作为溯源。"
-        "若证据笔记已足够支持判断，优先使用证据笔记；当前证据原文只用于核对和补充。"
-        "已确认事实中的槽位不要重复验证；当前轮只需要判断新证据能否补齐缺失槽位或修正冲突。"
-        "对于是否属于保险责任/是否赔付类任务，如果证据完整列举了可赔责任、费用类型或适用场景，而题干事项不在列举范围内，可以作为反向证据判断不属于责任范围；不必必须找到原文直接写不赔。"
-        "当任务首先需要判断是否赔付/是否属于责任范围时，封闭列举的责任范围或费用范围就是关键证据；若题干事项不在范围内，can_solve=true，filled_slots写明不属于范围及依据，不要继续把免赔额、赔付比例、限额或计算公式列为missing_slots。"
-        "如果证据足够，can_solve=true并提取filled_slots。"
-        "filled_slots只能写规则、公式、比例、定义、区间条件、题干明确给出的已知事实；不要在审查阶段计算或填写最终金额。"
-        "如果需要计算金额，只判断公式和输入数值是否齐全，把公式/比例作为filled_slots，最终计算留给单任务求解Agent。"
-        "禁止把选项中的金额当作事实；禁止根据选项倒推出filled_slots。"
-        "如果缺事实，missing_slots只写仍缺少的正向事实或计算依据，并给出3到8个关键词。"
-        "证据不足时必须输出failure_analysis，说明当前证据为什么不够，以及下一轮应同章节换检索词还是回目录换章节。"
-        "如果当前证据只是手续、流程、说明文字，但任务需要金额/公式/比例/区间，应明确建议回目录寻找价值、金额、账户、费用、比例、给付、领取等语义章节。"
-        "只输出JSON。"
+    return build_task_reasoning_audit_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        json.dumps(task, ensure_ascii=False, indent=2),
+        format_memory_slots(task_memory),
+        format_evidence_notes(evidence_notes or []),
+        format_evidence(evidence[-2:] if evidence_notes else evidence, max_chars=1600 if evidence_notes else 5000),
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-
-当前任务：
-{json.dumps(task, ensure_ascii=False, indent=2)}
-
-已确认事实：
-{format_memory_slots(task_memory)}
-
-证据笔记：
-{format_evidence_notes(evidence_notes or [])}
-
-当前证据原文（仅最近/必要片段，用于核对笔记；若笔记为空则为候选原文）：
-{format_evidence(evidence[-2:] if evidence_notes else evidence, max_chars=1600 if evidence_notes else 5000)}
-
-请输出：
-{{
-  "can_solve": true,
-  "filled_slots": [{{"slot": "规则/比例/公式/定义/题干已知事实", "value": "原文规则或题干明确数值，不要写最终计算金额", "evidence_ids": ["证据ID或题干"]}}],
-  "expand_evidence_ids": ["需要向后补充的锚点证据ID"],
-  "failure_analysis": {{"reason": "证据不足原因", "next_action": "同章节换词/回目录换章节", "avoid_titles": ["不应继续优先的标题"]}},
-  "missing_slots": [{{"slot": "缺失事实槽位", "target_doc_ids": ["doc_id"], "followup_query": "短关键词"}}]
-}}
-"""
-    return system, user
 
 
 def build_task_reasoning_result_prompt(state: AgentState, task: dict, task_memory: list[dict], audit: dict) -> tuple[str, str]:
-    system = (
-        "你是单任务求解Agent。只基于题干和已确认事实完成当前任务。"
-        "如果事实足以计算或判断，status=complete；如果真正缺关键公式、比例或数值，status=blocked。"
-        "赔付/给付/保险责任类任务应先判断题干事故、费用或责任项目是否属于条款列明的保险责任/费用范围；若已确认不属于范围，直接给出不赔/0，并说明依据，不要再因免赔额、比例或公式缺失而blocked。"
-        "禁止根据选项倒推事实，禁止使用选项中的金额修正计算。"
-        "计算题必须逐项写出公式、代入和算术过程；百分比要先换算成小数或明确乘法。"
-        "如果当前任务是某产品/合同/方案的赔付、给付、退保或收益总额，且题干包含多人、多次、多项费用或多个责任项目，result必须给出该任务口径下的总额，并在calculation中列出分项；不要只把第一个人或第一项的金额作为result。"
-        "遇到家庭共享免赔额、共享限额、累计抵扣等规则时，除非题干或条款明确给出按人分摊/按比例分配方法，否则不得自行把总赔付额按个人费用占比分配；任务问产品赔付总额时直接输出产品口径总额。"
-        "如果必须计算某个人/某一项金额但缺少分配规则，应status=blocked并写入missing_slots，不能用常见理解、通常理解或比例占比自行补齐。"
-        "如果发现已确认事实里存在互相冲突的计算结果，以题干数值和证据公式重新计算，并在warnings中说明冲突。"
-        "只输出JSON。"
+    return build_task_reasoning_result_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        json.dumps(task, ensure_ascii=False, indent=2),
+        format_memory_slots(task_memory),
+        json.dumps(audit, ensure_ascii=False),
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
-
-当前任务：
-{json.dumps(task, ensure_ascii=False, indent=2)}
-
-已确认事实：
-{format_memory_slots(task_memory)}
-
-审查结果：{json.dumps(audit, ensure_ascii=False)}
-
-请输出：
-{{
-  "task": "任务名",
-  "status": "complete/blocked",
-  "formula": "使用的公式；非计算任务可为空",
-  "substitution": "代入题干数值；非计算任务可为空",
-  "calculation": "逐步算术，例如 10 + 2 * 75% = 10 + 1.5 = 11.5",
-  "result": "计算结果或事实结论",
-  "basis": "简短依据",
-  "evidence_ids": ["证据ID或题干"],
-  "warnings": ["如发现冲突或忽略了错误中间结果，在这里说明"],
-  "missing_slots": ["真正缺失的关键事实"]
-}}
-"""
-    return system, user
 
 
 def build_task_reasoning_final_prompt(state: AgentState, task_results: list[dict]) -> tuple[str, str]:
     option_claims = build_option_claims(state["question"])
-    system = (
-        "你是最终作答Agent。只基于题干和各任务结果计算、排序并匹配选项。"
-        "选项只能用于最后匹配，不能用于倒推缺失规则，不能用选项金额修正任务结果。"
-        "匹配每个选项时必须逐项核对选项文本中的所有明确金额、赔付/不赔结论、排序关系和对象归属；只要任一明确声明与任务结果冲突，该选项必须is_match=false，不能因为其他部分接近或可排除其他选项而判true。"
-        "必须以option_claims.raw_text和option_claims.claims为准逐条核对；不得省略、改写、合并或反向解释选项中的任一claim。"
-        "任务结果中的evidence_notes是压缩后的证据依据；当任务result或basis过短时，必须用evidence_notes核对该任务结论，但仍不得用证据改写选项原文。"
-        "如果所有选项都与已确认任务结果冲突，应在missing_impact说明无完全匹配或题目/选项可能异常，不得把某个冲突较少的选项改写后判为true。"
-        "如果任务结果中有formula/substitution/calculation，优先核对这些结构化计算；匹配选项时以任务result代表的任务口径总额为准，不能把calculation中的分项金额误当作该任务总额。"
-        "若任务result同时列出总额和分项，最终匹配应使用总额；只有题干明确问某个人/某一项时才使用对应分项。"
-        "如果任务结果内部自相矛盾，要在missing_impact中说明冲突，不要直接用选项补救。"
-        "对于status=blocked的任务，不得编造缺失金额、比例、公式或规则；只有在其他已完成任务和明确证据足以排除选项时，才能说明排除逻辑。"
-        "只输出JSON。"
+    answer_format = str(state["question"].get("answer_format") or "").strip().lower()
+    if answer_format == "free":
+        answer_instruction = '"answer": "按题干要求填写最终答案；只填数字、日期、排序或文本本身，不要输出选项字母或解释"'
+    else:
+        answer_instruction = '"answer": "A/B/C/D"'
+    return build_task_reasoning_final_prompt_text(
+        maybe_fix_mojibake(state["question"]["question"]),
+        reasoning_options_text(state["question"]),
+        json.dumps(option_claims, ensure_ascii=False, indent=2),
+        json.dumps(task_results, ensure_ascii=False, indent=2),
+        answer_instruction,
     )
-    user = f"""
-题干：{maybe_fix_mojibake(state["question"]["question"])}
 
-选项原文：
-{reasoning_options_text(state["question"])}
 
-选项claim拆解（逐条核对这些claim，不得改写）：
-{json.dumps(option_claims, ensure_ascii=False, indent=2)}
+CHINESE_DIGIT_MAP = {
+    "〇": "0",
+    "零": "0",
+    "一": "1",
+    "二": "2",
+    "三": "3",
+    "四": "4",
+    "五": "5",
+    "六": "6",
+    "七": "7",
+    "八": "8",
+    "九": "9",
+}
 
-任务结果：
-{json.dumps(task_results, ensure_ascii=False, indent=2)}
 
-请输出：
-{{
-  "calculations": [{{"item": "对象", "amount": "金额/结论", "basis": "依据"}}],
-  "option_checks": [{{"option": "A/B/C/D", "is_match": true, "claim_checks": [{{"claim_index": 1, "raw_claim": "选项原文片段", "task_result": "对应任务结果", "match": true, "conflict_reason": "无或冲突原因"}}], "reason": "简短原因"}}],
-  "missing_impact": "无或说明缺失影响",
-  "answer": "A/B/C/D"
-}}
-"""
-    return system, user
+def chinese_number_to_int(text: str) -> int | None:
+    text = maybe_fix_mojibake(str(text or "")).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    if all(char in CHINESE_DIGIT_MAP for char in text):
+        return int("".join(CHINESE_DIGIT_MAP[char] for char in text))
+    if text == "十":
+        return 10
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = chinese_number_to_int(left) if left else 1
+        ones = chinese_number_to_int(right) if right else 0
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+    return None
+
+
+def parse_date_value(value: str) -> tuple[int, int, int | None] | None:
+    text = maybe_fix_mojibake(str(value or ""))
+    text = text.replace(" ", "")
+    match = re.search(r"((?:19|20)\d{2})年(\d{1,2})月(?:(\d{1,2})日)?", text)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3)) if match.group(3) else None
+        return year, month, day
+    match = re.search(r"([一二三四五六七八九〇零]{4})年([一二三四五六七八九十]{1,3})月(?:([一二三四五六七八九十]{1,3})日)?", text)
+    if match:
+        year = chinese_number_to_int(match.group(1))
+        month = chinese_number_to_int(match.group(2))
+        day = chinese_number_to_int(match.group(3)) if match.group(3) else None
+        if year and month:
+            return year, month, day
+    return None
+
+
+def compare_date_values(left: tuple[int, int, int | None], right: tuple[int, int, int | None]) -> int | None:
+    if left[:2] != right[:2]:
+        return 1 if left[:2] > right[:2] else -1
+    if left[2] is None or right[2] is None:
+        return None
+    if left[2] == right[2]:
+        return 0
+    return 1 if left[2] > right[2] else -1
+
+
+def task_result_date_by_doc_ordinal(task_results: list[dict]) -> dict[str, tuple[int, int, int | None]]:
+    result: dict[str, tuple[int, int, int | None]] = {}
+    for item in task_results:
+        if not isinstance(item, dict):
+            continue
+        surface = maybe_fix_mojibake(
+            " ".join(
+                str(part or "")
+                for part in (
+                    item.get("task"),
+                    item.get("result"),
+                    item.get("basis"),
+                    item.get("calculation"),
+                    item.get("substitution"),
+                )
+            )
+        )
+        date_value = None
+        for value in (item.get("result"), item.get("amount"), item.get("basis"), surface):
+            date_value = parse_date_value(str(value or ""))
+            if date_value:
+                break
+        if not date_value:
+            continue
+        if "第一份" in surface or "第一" in surface:
+            result.setdefault("第一", date_value)
+        if "第二份" in surface or "第二" in surface:
+            result.setdefault("第二", date_value)
+    return result
+
+
+def deterministic_time_comparison_answer(state: AgentState, task_results: list[dict]) -> str:
+    question = maybe_fix_mojibake(str(state.get("question", {}).get("question") or ""))
+    if not any(term in question for term in ("晚于", "早于", "不晚于", "不早于")):
+        return ""
+    if not ("第一" in question and "第二" in question):
+        return ""
+    dates = task_result_date_by_doc_ordinal(task_results)
+    first = dates.get("第一")
+    second = dates.get("第二")
+    if not first or not second:
+        return ""
+    cmp_result = compare_date_values(second, first)
+    if cmp_result is None:
+        return ""
+    if "第二" in question and "第一" in question:
+        if "不晚于" in question:
+            verdict = cmp_result <= 0
+        elif "不早于" in question:
+            verdict = cmp_result >= 0
+        elif "晚于" in question:
+            verdict = cmp_result > 0
+        elif "早于" in question:
+            verdict = cmp_result < 0
+        else:
+            return ""
+        return chr(0x662F) if verdict else chr(0x5426)
+    return ""
 
 
 def doc_root_sections(doc_id: str) -> list[dict]:
@@ -4141,9 +3216,6 @@ def doc_child_sections(doc_id: str, parent_section_id: str) -> list[dict]:
         if str(section.get("parent_id") or "") == str(parent_section_id)
     ]
 
-
-def section_title(section: dict) -> str:
-    return maybe_fix_mojibake(str(section.get("title") or " > ".join(section.get("heading_path") or []))).strip()
 
 
 def task_query_bundle(task: dict) -> str:
@@ -5055,9 +4127,20 @@ def human_toc_reasoning_node(state: AgentState) -> AgentState:
     else:
         output, usage = call_qwen_json(system, user)
         add_usage(state, usage)
-    answer = str(output.get("answer") or "").strip().upper()
-    if answer not in "ABCD":
-        answer = ""
+    answer_format = str(state["question"].get("answer_format") or "").strip().lower()
+    answer = str(output.get("answer") or "").strip()
+    if answer_format != "free":
+        answer = answer.upper()
+        if answer not in "ABCD":
+            answer = ""
+    else:
+        deterministic_answer = deterministic_time_comparison_answer(state, task_results)
+        if deterministic_answer:
+            output["deterministic_time_comparison_answer"] = deterministic_answer
+            if answer != deterministic_answer:
+                output["answer_before_time_comparison_fix"] = answer
+                add_trace(state, f"human toc time comparison override {answer}->{deterministic_answer}")
+            answer = deterministic_answer
     state["final_answer"] = answer
     state["status"] = "done"
     state["task_reasoning_plan"] = plan
@@ -5071,273 +4154,76 @@ def human_toc_reasoning_node(state: AgentState) -> AgentState:
 
 
 def build_graph():
-    graph = StateGraph(AgentState)
-    graph.add_node("init", init_state)
-    graph.add_node("human_toc_reasoning", human_toc_reasoning_node)
-    graph.add_node("slot_planner", slot_planner_node)
-    graph.add_node("route_docs", route_docs_node)
-    graph.add_node("retrieve_initial", retrieve_initial_node)
-    graph.add_node("evidence_extract", evidence_extract_node)
-    graph.add_node("audit", audit_node)
-    graph.add_node("review_original_after_subsearch", review_original_after_subsearch_node)
-    graph.add_node("focus_evidence", focus_evidence_node)
-    graph.add_node("retrieve_more", retrieve_more_node)
-    graph.add_node("toc_repair", toc_repair_node)
-    graph.add_node("judge", judge_node)
-    graph.add_node("advance_option", advance_option_node)
-    graph.add_node("finalize", finalize_node)
-
-    graph.set_entry_point("init")
-    graph.add_conditional_edges(
-        "init",
-        lambda state: "human_toc_reasoning" if use_task_reasoning_path(state["question"]) else "slot_planner",
-        {"human_toc_reasoning": "human_toc_reasoning", "slot_planner": "slot_planner"},
-    )
-    graph.add_edge("human_toc_reasoning", "finalize")
-    graph.add_edge("slot_planner", "route_docs")
-    graph.add_edge("route_docs", "retrieve_initial")
-    graph.add_edge("retrieve_initial", "evidence_extract")
-    graph.add_edge("evidence_extract", "audit")
-    graph.add_conditional_edges(
-        "audit",
-        route_after_audit,
-        {
-            "review_original_after_subsearch": "review_original_after_subsearch",
-            "focus_evidence": "focus_evidence",
-            "retrieve_more": "retrieve_more",
-            "toc_repair": "toc_repair",
-            "judge": "judge",
+    return build_enterprise_graph(
+        AgentState,
+        nodes={
+            "init": init_state,
+            "human_toc_reasoning": human_toc_reasoning_node,
+            "slot_planner": slot_planner_node,
+            "route_docs": route_docs_node,
+            "retrieve_initial": retrieve_initial_node,
+            "evidence_extract": evidence_extract_node,
+            "evidence_read": evidence_read_node,
+            "audit": audit_node,
+            "review_original_after_subsearch": review_original_after_subsearch_node,
+            "focus_evidence": focus_evidence_node,
+            "retrieve_more": retrieve_more_node,
+            "toc_repair": toc_repair_node,
+            "judge": judge_node,
+            "advance_option": advance_option_node,
+            "finalize": finalize_node,
         },
+        route_after_audit=route_after_audit,
+        route_after_advance=route_after_advance,
+        use_task_reasoning_path=use_task_reasoning_path,
     )
-    graph.add_edge("review_original_after_subsearch", "audit")
-    graph.add_edge("focus_evidence", "audit")
-    graph.add_edge("retrieve_more", "evidence_extract")
-    graph.add_edge("toc_repair", "evidence_extract")
-    graph.add_edge("judge", "advance_option")
-    graph.add_conditional_edges("advance_option", route_after_advance, {"route_docs": "slot_planner", "finalize": "finalize"})
-    graph.add_edge("finalize", END)
-    return graph.compile()
 
 
-def normalize_answer(answer: str, answer_format: str) -> str:
-    letters = [char for char in answer.upper() if char in "ABCD"]
-    if answer_format == "multi":
-        return "".join(sorted(set(letters), key="ABCD".index))
-    if answer_format in {"mcq", "tf"}:
-        return letters[0] if letters else ""
-    return "".join(sorted(set(letters), key="ABCD".index))
-
-
-def upsert_answer_csv(state: AgentState) -> None:
-    path = Path(ANSWER_CSV)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    answer = normalize_answer(state.get("final_answer", ""), state["question"].get("answer_format", ""))
-    usage = state.get("token_usage", {})
-    row = {
-        "qid": state["qid"],
-        "answer": answer,
-        "prompt_tokens": str(usage.get("prompt_tokens", 0)),
-        "completion_tokens": str(usage.get("completion_tokens", 0)),
-        "total_tokens": str(usage.get("total_tokens", 0)),
-    }
-
-    rows: list[dict[str, str]] = []
-    if path.exists():
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.DictReader(f))
-    rows = [existing for existing in rows if existing.get("qid") not in {state["qid"], "summary"}]
-    rows.append(row)
-
-    total_prompt = sum(int(item.get("prompt_tokens") or 0) for item in rows)
-    total_completion = sum(int(item.get("completion_tokens") or 0) for item in rows)
-    summary = {
-        "qid": "summary",
-        "answer": "",
-        "prompt_tokens": str(total_prompt),
-        "completion_tokens": str(total_completion),
-        "total_tokens": str(total_prompt + total_completion),
-    }
-    rows = [summary] + sorted(rows, key=lambda item: item["qid"])
-
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["qid", "answer", "prompt_tokens", "completion_tokens", "total_tokens"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"answer_csv={path.resolve()}")
-    print(f"saved_answer={state['qid']} -> {answer}")
-
-
-def write_outputs(state: AgentState) -> None:
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_json = output_dir / f"langgraph_{state['qid']}_state.json"
-    output_md = output_dir / f"langgraph_{state['qid']}.md"
-    output_json.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    lines = [f"# LangGraph Agent Debug: {state['qid']}", ""]
-    lines.append(f"status: `{state.get('status')}`")
-    lines.append(f"final_answer: `{state.get('final_answer', '')}`")
-    lines.append(f"token_usage: `{json.dumps(state.get('token_usage', {}), ensure_ascii=False)}`")
-    lines.append("")
-    lines.append(f"question: {maybe_fix_mojibake(state['question']['question'])}")
-    lines.append("")
-    lines.append("## Trace")
-    for item in state.get("trace", []):
-        lines.append(f"- {item}")
-    lines.append("")
-    if state.get("task_reasoning_debug"):
-        debug = state["task_reasoning_debug"]
-        lines.append("## Task Reasoning Debug")
-        lines.append("")
-        lines.append("plan:")
-        lines.append("```json")
-        lines.append(json.dumps(debug.get("plan", {}), ensure_ascii=False, indent=2))
-        lines.append("```")
-        lines.append("")
-        for task_log in debug.get("tasks", []):
-            lines.append(f"### Task {task_log.get('task_index')}")
-            lines.append("")
-            lines.append("task:")
-            lines.append("```json")
-            lines.append(json.dumps(task_log.get("task", {}), ensure_ascii=False, indent=2))
-            lines.append("```")
-            lines.append("")
-            if task_log.get("section_plans"):
-                lines.append("section_plans:")
-                lines.append("```json")
-                lines.append(json.dumps(task_log.get("section_plans"), ensure_ascii=False, indent=2))
-                lines.append("```")
-                lines.append("")
-            for round_log in task_log.get("rounds", []):
-                lines.append(f"round {round_log.get('round')}:")
-                lines.append("```json")
-                lines.append(json.dumps(
-                    {
-                        "audit": round_log.get("audit"),
-                        "filtered_filled_slots": round_log.get("filtered_filled_slots"),
-                        "dropped_filled_slots": round_log.get("dropped_filled_slots"),
-                        "memory_slots": round_log.get("memory_slots"),
-                        "evidence_notes": round_log.get("evidence_notes"),
-                        "evidence_notes_after_followup": round_log.get("evidence_notes_after_followup"),
-                        "audit_evidence_ids": [
-                            item.get("evidence_id") for item in round_log.get("audit_evidence", [])
-                        ],
-                        "route_steps": round_log.get("route_steps"),
-                        "missing_slots_used": round_log.get("missing_slots_used"),
-                        "tried_candidates": round_log.get("tried_candidates"),
-                        "followup_route_steps": round_log.get("followup_route_steps"),
-                        "anchor_expanded_ids": [
-                            item.get("evidence_id") for item in round_log.get("anchor_expanded", [])
-                        ],
-                        "followup_evidence_ids": [
-                            item.get("evidence_id") for item in round_log.get("followup_evidence", [])
-                        ],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ))
-                lines.append("```")
-                for section_name in (
-                    "audit",
-                    "filtered_filled_slots",
-                    "dropped_filled_slots",
-                    "memory_slots",
-                    "evidence_notes",
-                    "evidence_notes_after_followup",
-                    "audit_evidence",
-                    "route_steps",
-                    "missing_slots_used",
-                    "tried_candidates",
-                    "followup_route_steps",
-                ):
-                    value = round_log.get(section_name)
-                    if value:
-                        lines.append(f"- {section_name}:")
-                        lines.append("```json")
-                        lines.append(json.dumps(value, ensure_ascii=False, indent=2))
-                        lines.append("```")
-                if round_log.get("evidence"):
-                    lines.append("- evidence:")
-                    for ev in round_log.get("evidence", []):
-                        heading = " > ".join(ev.get("heading_path") or [])
-                        text = re.sub(r"\s+", " ", ev.get("text", "")).strip()
-                        lines.append(f"  - `{ev['doc_id']}` `{ev['page_id']}` score={ev['score']:.3f} source={ev['source']}")
-                        lines.append(f"    - heading: {heading}")
-                        if ev.get("selected_sections"):
-                            lines.append(f"    - selected_sections: {json.dumps(ev.get('selected_sections'), ensure_ascii=False)}")
-                        lines.append(f"    - text: {text[:400]}")
-                if round_log.get("followup_evidence"):
-                    lines.append("- followup_evidence:")
-                    for ev in round_log.get("followup_evidence", []):
-                        heading = " > ".join(ev.get("heading_path") or [])
-                        text = re.sub(r"\s+", " ", ev.get("text", "")).strip()
-                        lines.append(f"  - `{ev['doc_id']}` `{ev['page_id']}` score={ev['score']:.3f} source={ev['source']}")
-                        lines.append(f"    - heading: {heading}")
-                        if ev.get("selected_sections"):
-                            lines.append(f"    - selected_sections: {json.dumps(ev.get('selected_sections'), ensure_ascii=False)}")
-                        lines.append(f"    - text: {text[:400]}")
-                if round_log.get("anchor_expanded"):
-                    lines.append("- anchor_expanded:")
-                    for ev in round_log.get("anchor_expanded", []):
-                        heading = " > ".join(ev.get("heading_path") or [])
-                        text = re.sub(r"\s+", " ", ev.get("text", "")).strip()
-                        lines.append(f"  - `{ev['doc_id']}` `{ev['page_id']}` score={ev['score']:.3f} source={ev['source']}")
-                        lines.append(f"    - heading: {heading}")
-                        if ev.get("selected_sections"):
-                            lines.append(f"    - selected_sections: {json.dumps(ev.get('selected_sections'), ensure_ascii=False)}")
-                        lines.append(f"    - text: {text[:400]}")
-                lines.append("")
-            lines.append("result:")
-            lines.append("```json")
-            lines.append(json.dumps(task_log.get("result", {}), ensure_ascii=False, indent=2))
-            lines.append("```")
-            lines.append("")
-        lines.append("final judgment:")
-        lines.append("```json")
-        lines.append(json.dumps(state.get("reasoning_judgment", {}), ensure_ascii=False, indent=2))
-        lines.append("```")
-        lines.append("")
-    for option, option_state in state["option_states"].items():
-        lines.append(f"## Option {option}")
-        lines.append("")
-        lines.append(f"claim: {option_state['claim']}")
-        lines.append(f"target_doc_ids: {option_state.get('target_doc_ids')}")
-        lines.append(f"status: `{option_state.get('status')}`")
-        lines.append("")
-        for key in ("router", "initial_rerank", "audit", "inner_focus", "toc_repair", "judgment"):
-            lines.append(f"{key}:")
-            lines.append("```json")
-            lines.append(json.dumps(option_state.get(key, {}), ensure_ascii=False, indent=2))
-            lines.append("```")
-            lines.append("")
-        lines.append("evidence:")
-        for ev in option_state.get("evidence", []):
-            heading = " > ".join(ev.get("heading_path") or [])
-            text = re.sub(r"\s+", " ", ev.get("text", "")).strip()
-            lines.append(f"- `{ev['doc_id']}` `{ev['page_id']}` score={ev['score']:.3f} source={ev['source']}")
-            lines.append(f"  - heading: {heading}")
-            lines.append(f"  - text: {text[:1200]}")
-        lines.append("")
-    output_md.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+def all_doc_ids_for_loaded_index() -> list[str]:
+    return sorted(PAGES_BY_DOC.keys())
 
 
 def main() -> None:
-    questions = load_json(QUESTIONS_PATH)
-    question = next(item for item in questions if item["qid"] == TARGET_QID)
+    atomic_records = load_records(ATOMIC_QUESTIONS_PATH)
+    atomic = select_atomic_record(atomic_records, TARGET_QID)
+    question = atomic_to_legacy_question(
+        atomic,
+        TARGET_QID,
+        all_doc_ids_for_loaded_index(),
+        lambda doc_id: doc_profile_text(doc_id, max_chars=1400),
+        TREE_DOC_BY_ID,
+    )
+    print(f"atomic_id={question['qid']}")
+    print(f"domain={question.get('enterprise_domain')}")
+    print(f"page_index={PAGE_INDEX_PATH}")
+    print(f"prefilter_doc_ids={json.dumps(question.get('enterprise_prefiltered_doc_ids', []), ensure_ascii=False)}")
     app = build_graph()
     final_state = app.invoke({"question": question})
     print(f"qid={final_state['qid']}")
-    print(f"answer={final_state.get('final_answer', '')}")
+    enterprise_result = write_enterprise_result(final_state, ANSWER_CSV)
+    print(f"answer={enterprise_result.get('answer', '')}")
+    print(f"raw_final_answer={final_state.get('final_answer', '')}")
     print(f"status={final_state.get('status')}")
     print(f"token_usage={json.dumps(final_state.get('token_usage', {}), ensure_ascii=False)}")
     if APPEND_ANSWER_CSV:
-        upsert_answer_csv(final_state)
+        upsert_answer_csv(final_state, ANSWER_CSV)
     if SAVE_DEBUG_OUTPUTS:
-        write_outputs(final_state)
+        write_outputs(final_state, OUTPUT_DIR)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
 
 
 
