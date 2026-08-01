@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 
 from enterprise_qa_agent.src.routing.atomic_adapter import (
     atomic_to_legacy_question,
+    chat_to_legacy_question,
     select_atomic_record,
 )
 from enterprise_qa_agent.src.routing.doc_routing import (
@@ -631,11 +632,16 @@ def split_note_sentences(text: str) -> list[str]:
 
 def evidence_note_score(sentence: str, query_tokens: set[str], query_text: str) -> float:
     sentence_fixed = maybe_fix_mojibake(sentence)
+    query_fixed = maybe_fix_mojibake(query_text)
     sentence_tokens = set(tokenize(sentence_fixed))
     score = float(len(query_tokens & sentence_tokens) * 2)
     for term in EVIDENCE_NOTE_TERMS:
         if term in sentence_fixed:
             score += 3.0
+    decision_terms = ("是否", "能否", "可否", "是否只要", "是否可以", "能不能", "可以", "开展", "成立", "适用")
+    normative_terms = ("不得", "禁止", "不应", "不能", "不得开展", "不得建立", "应当", "必须", "批准", "审批", "许可", "限制", "例外", "除外")
+    if any(term in query_fixed for term in decision_terms) and any(term in sentence_fixed for term in normative_terms):
+        score += 8.0
     for year in re.findall(r"(?:19|20)\d{2}", query_text):
         if year in sentence_fixed:
             score += 2.0
@@ -647,6 +653,64 @@ def evidence_note_score(sentence: str, query_tokens: set[str], query_text: str) 
     return score
 
 
+EVIDENCE_NOTE_ASPECT_TERMS = {
+    "cost": ("降本", "成本", "成本优势", "节省", "材料", "用量", "更高效", "效率", "费用", "消耗"),
+    "performance": ("性能", "强度", "轻薄", "厚度", "精度", "良率", "可靠", "成活率", "产蛋", "生长速度", "料肉比"),
+    "case": ("案例", "公司", "产品", "业务", "技术", "设备", "方案", "实现", "突破"),
+    "normative": ("不得", "禁止", "不应", "不能", "不得开展", "不得建立", "应当", "必须", "批准", "审批", "许可", "限制", "例外", "除外"),
+}
+
+
+def evidence_note_aspects(sentence: str, query_text: str) -> set[str]:
+    sentence_fixed = maybe_fix_mojibake(sentence)
+    query_fixed = maybe_fix_mojibake(query_text)
+    aspects: set[str] = set()
+    for aspect, terms in EVIDENCE_NOTE_ASPECT_TERMS.items():
+        if any(term in sentence_fixed for term in terms) and any(term in query_fixed for term in terms):
+            aspects.add(aspect)
+    return aspects
+
+
+def extract_tiered_formula_notes(state: AgentState, task: dict, item: dict, max_notes: int = 2) -> list[dict]:
+    if not state.get("question", {}).get("enterprise_chat"):
+        return []
+    query_text = task_note_query_text(state, task)
+    if not any(term in query_text for term in ("金额", "退保", "解除", "现金价值", "账户", "收益", "比例", "计算")):
+        return []
+    text = compact_html_text(str(item.get("text") or ""))
+    if not any(term in text for term in ("等于", "计算", "比例", "金额之和")):
+        return []
+    if not any(term in text for term in ("保单年度", "年度", "年龄", "周岁", "期限", "区间", "及以后", "至第")):
+        return []
+    heading = " > ".join(item.get("heading_path") or [])
+    patterns = [
+        r"(?:\d+\.\s*)?[^。；;]{0,40}?第\s*\d+\s*个?保单年度[^。；;]{0,220}?等于[^。；;]{0,260}(?:。|；|;|$)",
+        r"(?:\d+\.\s*)?[^。；;]{0,40}?第\s*\d+\s*年[^。；;]{0,220}?等于[^。；;]{0,260}(?:。|；|;|$)",
+        r"[^。；;]{0,80}?(?:按以下方法计算|计算方法)[^。；;]{0,420}(?:。|；|;|$)",
+    ]
+    notes: list[dict] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            note_text = compact_text(match.group(0))
+            if len(note_text) < 30 or note_text in seen:
+                continue
+            seen.add(note_text)
+            notes.append(
+                {
+                    "source_evidence_id": item.get("evidence_id"),
+                    "doc_id": item.get("doc_id"),
+                    "heading": heading,
+                    "note": note_text[:520],
+                    "score": 120.0,
+                    "extracted_by": "tiered_formula_extractor",
+                }
+            )
+            if len(notes) >= max_notes:
+                return notes
+    return notes
+
+
 def extract_evidence_notes_for_item(state: AgentState, task: dict, item: dict, max_notes: int = 1) -> list[dict]:
     query_text = task_note_query_text(state, task)
     query_tokens = set(tokenize(query_text))
@@ -654,21 +718,32 @@ def extract_evidence_notes_for_item(state: AgentState, task: dict, item: dict, m
     sentences = split_note_sentences(item.get("text", ""))
     if not sentences:
         return []
-    scored: list[tuple[float, int, str]] = []
+    scored: list[tuple[float, int, str, set[str]]] = []
     for idx, sentence in enumerate(sentences):
         score = evidence_note_score(sentence, query_tokens, query_text)
+        aspects = evidence_note_aspects(sentence, query_text)
+        if aspects:
+            score += 1.5 * len(aspects)
         if score > 0:
-            scored.append((score, idx, sentence))
+            scored.append((score, idx, sentence, aspects))
     if not scored and len(compact_text(item.get("text", ""))) <= 320:
-        scored.append((1.0, 0, compact_text(item.get("text", ""))))
+        scored.append((1.0, 0, compact_text(item.get("text", "")), set()))
     scored.sort(key=lambda row: (row[0], -row[1]), reverse=True)
-    notes: list[dict] = []
+    notes: list[dict] = extract_tiered_formula_notes(state, task, item, max_notes=max_notes)
     seen_text: set[str] = set()
-    for score, _idx, sentence in scored:
+    for note in notes:
+        seen_text.add(compact_text(str(note.get("note") or "")))
+    covered_aspects: set[str] = set()
+    for score, _idx, sentence, aspects in scored:
+        if len(notes) >= max_notes:
+            break
+        if aspects and aspects <= covered_aspects and len(notes) >= 1:
+            continue
         note_text = compact_text(sentence)[:260]
         if not note_text or note_text in seen_text:
             continue
         seen_text.add(note_text)
+        covered_aspects.update(aspects)
         notes.append(
             {
                 "source_evidence_id": item.get("evidence_id"),
@@ -676,6 +751,121 @@ def extract_evidence_notes_for_item(state: AgentState, task: dict, item: dict, m
                 "heading": heading,
                 "note": note_text,
                 "score": round(score, 3),
+            }
+        )
+    if len(notes) < max_notes:
+        for score, _idx, sentence, _aspects in scored:
+            if len(notes) >= max_notes:
+                break
+            note_text = compact_text(sentence)[:260]
+            if not note_text or note_text in seen_text:
+                continue
+            seen_text.add(note_text)
+            notes.append(
+                {
+                    "source_evidence_id": item.get("evidence_id"),
+                    "doc_id": item.get("doc_id"),
+                    "heading": heading,
+                    "note": note_text,
+                    "score": round(score, 3),
+                }
+            )
+    return notes
+
+
+def should_llm_compress_evidence(state: AgentState, task: dict, item: dict) -> bool:
+    if not state.get("question", {}).get("enterprise_chat"):
+        return False
+    text = compact_html_text(str(item.get("text") or ""))
+    if len(text) >= 1000:
+        return True
+    question_text = maybe_fix_mojibake(str(state.get("question", {}).get("question") or ""))
+    decision_terms = ("是否", "能否", "可否", "是否只要", "是否可以", "能不能", "可以", "开展", "成立", "适用")
+    normative_terms = ("不得", "禁止", "不应", "不能", "不得开展", "不得建立", "应当", "必须", "批准", "审批", "许可", "限制", "例外", "除外")
+    if any(term in question_text for term in decision_terms) and any(term in text for term in normative_terms):
+        return True
+    return len(task.get("search_slots") or []) >= 2 and len(text) >= 500
+
+
+def llm_compress_evidence_for_task(state: AgentState, task: dict, item: dict, max_notes: int = 4) -> list[dict]:
+    query_text = task_note_query_text(state, task)
+    heading = " > ".join(item.get("heading_path") or [])
+    evidence_text = compact_html_text(str(item.get("text") or ""))
+    evidence_text = re.sub(r"\s+", " ", evidence_text).strip()[:5200]
+    if not evidence_text:
+        return []
+    system = (
+        "你是企业问答证据压缩Agent。你必须同时结合原始用户问题、当前任务和槽位来压缩证据。"
+        "不要只围绕槽位字面词抽取；如果证据中存在能直接回答原始问题的更强规则，必须保留。"
+        "对于是否/能否/是否只要/是否可以/能不能/是否成立/是否适用类问题，优先抽取许可、禁止、限制、例外、前置条件、审批条件和适用对象。"
+        "如果同一证据块同时出现审批条件和禁止/不得/不能类规则，必须同时保留，且说明禁止性规则优先。"
+        "不要按开头截断，不要因为原文没有逐字出现问题中的抽象词就判缺失。"
+        "成本下降、成本优势、效率提升、材料节省、功耗下降、单位成本下降可支持降本类槽位；"
+        "速率、精度、强度、轻薄、可靠性、良率、成活率、产蛋率等改善可支持性能提升类槽位。"
+        "对于金额、退保、解除、收益、赔付、给付类问题，如果证据块给出公式、区间比例、账户价值构成或变量定义，"
+        "必须保留公式变量及适用条件；如果题干已给出变量数值，不要因为题干没有直接给最终名词金额就判缺失。"
+        "如果任务要求同时/均/都，A和B可以来自同一证据块或不同段落，但必须先识别事实归属的主体/对象/领域/案例。"
+        "证据只能用于其明确归属的主体；不同主体、不同领域或不同案例之间不得互相复用。"
+        "只有在证据明确说明它们属于同一主体、同一案例、同一技术路径或同一应用场景时，才可合并为有关联事实。"
+        "只输出JSON。"
+    )
+    user = f"""
+问题：
+{maybe_fix_mojibake(state["question"]["question"])}
+
+当前任务和槽位：
+{json.dumps(task_prompt_payload(state, task), ensure_ascii=False, indent=2)}
+
+检索意图：
+{query_text}
+
+证据块：
+[{item.get("evidence_id")}] doc={item.get("doc_id")} heading={heading}
+{evidence_text}
+
+请输出：
+{{
+    "notes": [
+    {{
+      "subject": "该事实明确归属的主体/对象/领域/案例；无法确定则留空",
+      "slot": "对应槽位或关系",
+      "value": "从完整证据块抽取出的关键事实，保留主体、对象、指标、数字、比较关系、许可/禁止/限制/例外/审批条件",
+      "relation": "如果涉及多个槽位，说明事实之间的关系；如果跨主体则必须说明不能互相替代；否则留空"
+    }}
+  ]
+}}
+"""
+    try:
+        if DRY_RUN_WITHOUT_LLM:
+            output = {"notes": []}
+        else:
+            output, usage = call_qwen_json(system, user)
+            add_usage(state, usage)
+    except Exception:
+        return []
+    notes: list[dict] = []
+    seen: set[str] = set()
+    for raw in output.get("notes") or []:
+        if not isinstance(raw, dict):
+            continue
+        slot = maybe_fix_mojibake(str(raw.get("slot") or "")).strip()
+        subject = maybe_fix_mojibake(str(raw.get("subject") or "")).strip()
+        value = maybe_fix_mojibake(str(raw.get("value") or "")).strip()
+        relation = maybe_fix_mojibake(str(raw.get("relation") or "")).strip()
+        subject_text = f"主体={subject}" if subject else ""
+        note_text = "；".join(part for part in (subject_text, slot, value, relation) if part)
+        note_text = compact_text(note_text)[:420]
+        if not note_text or note_text in seen:
+            continue
+        seen.add(note_text)
+        notes.append(
+            {
+                "source_evidence_id": item.get("evidence_id"),
+                "doc_id": item.get("doc_id"),
+                "heading": heading,
+                "note": note_text,
+                "score": 99.0,
+                "compressed_by": "llm_slot_compressor",
             }
         )
         if len(notes) >= max_notes:
@@ -692,12 +882,25 @@ def update_task_evidence_notes(
     max_total: int = 10,
 ) -> list[dict]:
     new_notes: list[dict] = []
+    is_enterprise_chat = bool(state.get("question", {}).get("enterprise_chat"))
+    per_item_notes = 3 if is_enterprise_chat else 1
+    if is_enterprise_chat and max_total == 10:
+        max_total = 14
+    llm_compressed = 0
     for item in evidence:
         evidence_id = str(item.get("evidence_id") or "")
         if not evidence_id or evidence_id in noted_ids:
             continue
         noted_ids.add(evidence_id)
-        new_notes.extend(extract_evidence_notes_for_item(state, task, item))
+        compressed_notes: list[dict] = []
+        if llm_compressed < 2 and should_llm_compress_evidence(state, task, item):
+            compressed_notes = llm_compress_evidence_for_task(state, task, item)
+            if compressed_notes:
+                llm_compressed += 1
+        if compressed_notes:
+            new_notes.extend(compressed_notes)
+        else:
+            new_notes.extend(extract_evidence_notes_for_item(state, task, item, max_notes=per_item_notes))
     merged = notes + new_notes
     if len(merged) > max_total:
         merged = merged[-max_total:]
@@ -2852,6 +3055,96 @@ def compact_evidence_notes_for_final(notes: list[dict], max_notes: int = 6) -> l
         })
     return compact
 
+
+def task_subject_terms(task: dict) -> list[str]:
+    terms: list[str] = []
+    for fact in task.get("known_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        slot = maybe_fix_mojibake(str(fact.get("slot") or "")).strip()
+        value = maybe_fix_mojibake(str(fact.get("value") or "")).strip()
+        if not value:
+            continue
+        if slot and any(marker in slot for marker in ("主体", "对象", "领域", "行业", "公司", "产品", "案例", "技术")):
+            terms.append(value)
+    task_name = maybe_fix_mojibake(str(task.get("task") or "")).strip()
+    for pattern in (
+        r"([\u4e00-\u9fffA-Za-z0-9]{2,20}?领域)",
+        r"([\u4e00-\u9fffA-Za-z0-9]{2,24}?制造)",
+        r"([\u4e00-\u9fffA-Za-z0-9]{2,24}?行业)",
+    ):
+        for match in re.findall(pattern, task_name):
+            terms.append(match)
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def text_has_any_subject_term(text: str, subject_terms: list[str]) -> bool:
+    fixed = maybe_fix_mojibake(str(text or ""))
+    return any(term and term in fixed for term in subject_terms)
+
+
+def result_has_subject_mismatch(task_result: dict, task: dict) -> bool:
+    subject_terms = task_subject_terms(task)
+    if not subject_terms:
+        return False
+    result_text = maybe_fix_mojibake(
+        " ".join(
+            str(part or "")
+            for part in (
+                task_result.get("result"),
+                task_result.get("basis"),
+                " ".join(str(item) for item in task_result.get("warnings") or []),
+            )
+        )
+    )
+    notes_text = maybe_fix_mojibake(
+        " ".join(str(note.get("note") or "") for note in task_result.get("evidence_notes") or [] if isinstance(note, dict))
+    )
+    combined = f"{result_text}\n{notes_text}"
+    mismatch_markers = (
+        "与当前任务无关",
+        "与该领域无关",
+        "与光通信领域无关",
+        "非当前领域",
+        "不属于当前领域",
+        "不能用于",
+        "不能支持",
+        "不能互相替代",
+        "未涉及",
+        "未提供",
+        "证据不足",
+        "无法支持",
+    )
+    if any(marker in combined for marker in mismatch_markers) and not text_has_any_subject_term(result_text, subject_terms):
+        return True
+    subject_note_lines = [line for line in re.split(r"[。\n；;]+", notes_text) if "主体=" in line]
+    for line in subject_note_lines:
+        if text_has_any_subject_term(line, subject_terms) and any(marker in line for marker in mismatch_markers):
+            return True
+    if subject_note_lines and not any(text_has_any_subject_term(line, subject_terms) for line in subject_note_lines):
+        return True
+    if "已确认事实" in result_text and any(marker in notes_text for marker in mismatch_markers):
+        return True
+    return False
+
+
+def enforce_task_result_subject_binding(task_result: dict, task: dict) -> dict:
+    if task_result.get("status") != "complete":
+        return task_result
+    if not result_has_subject_mismatch(task_result, task):
+        return task_result
+    task_result["status"] = "blocked"
+    task_result.setdefault("warnings", []).append("结果证据主体与当前任务主体不匹配，已改为blocked")
+    missing = list(task_result.get("missing_slots") or [])
+    fallback = maybe_fix_mojibake(str(task.get("task") or "当前主体对应证据")).strip()
+    if fallback and fallback not in missing:
+        missing.append(fallback)
+    task_result["missing_slots"] = missing
+    if not task_result.get("basis"):
+        task_result["basis"] = "当前证据主体与任务主体不匹配，不能用于该主体判断。"
+    return task_result
+
+
 def generalize_query_terms(text: str) -> list[str]:
     text = maybe_fix_mojibake(str(text or ""))
     queries: list[str] = []
@@ -2937,7 +3230,10 @@ def rewrite_followup_queries(
 
 
 def build_task_reasoning_plan_prompt(state: AgentState) -> tuple[str, str]:
-    doc_lines = "\n".join(f"- {alias}: {doc_id}" for doc_id, alias in state["doc_aliases"].items())
+    if state["question"].get("enterprise_chat"):
+        doc_lines = doc_profile_lines(state.get("doc_ids") or [])
+    else:
+        doc_lines = "\n".join(f"- {alias}: {doc_id}" for doc_id, alias in state["doc_aliases"].items())
     valid_doc_ids = [str(doc_id) for doc_id in state.get("doc_ids", [])]
     return build_task_reasoning_plan_prompt_text(
         maybe_fix_mojibake(state["question"]["question"]),
@@ -2968,7 +3264,260 @@ def resolve_plan_doc_ids(raw_doc_ids: list, default_doc_ids: list[str], doc_alia
     return resolved
 
 
-def normalize_task_reasoning_plan(plan: dict, default_doc_ids: list[str], doc_aliases: dict[str, str] | None = None) -> list[dict]:
+def is_speculative_required_slot(slot: str) -> bool:
+    compact = re.sub(r"\s+", "", maybe_fix_mojibake(str(slot or "")))
+    patterns = (
+        "是否有其他",
+        "是否还有",
+        "有无其他",
+        "有没有其他",
+        "其他退保扣费",
+        "其他扣费",
+        "额外扣费",
+        "额外费用",
+        "另有扣费",
+        "另有费用",
+        "是否存在其他",
+    )
+    return any(pattern in compact for pattern in patterns)
+
+
+def task_entity_key(task: dict) -> str:
+    parts: list[str] = []
+    for fact in task.get("known_facts") or []:
+        slot = maybe_fix_mojibake(str(fact.get("slot") or "")).strip()
+        value = maybe_fix_mojibake(str(fact.get("value") or "")).strip()
+        if not value:
+            continue
+        if slot and any(term in slot for term in ("领域", "对象", "主体", "公司", "产品", "技术", "地区", "行业")):
+            parts.append(value)
+    return "|".join(dict.fromkeys(parts))
+
+
+def should_merge_enterprise_relation_tasks(question_text: str, tasks: list[dict]) -> bool:
+    text = maybe_fix_mojibake(question_text)
+    if not any(term in text for term in ("同时", "是否都", "是否均", "均", "都", "分别是否", "都带来", "均带来")):
+        return False
+    retrieve_tasks = [task for task in tasks if task.get("task_type") != "summarize"]
+    if len(retrieve_tasks) < 2:
+        return False
+    entity_keys = [task_entity_key(task) for task in retrieve_tasks]
+    return any(key and entity_keys.count(key) >= 2 for key in set(entity_keys))
+
+
+def merge_enterprise_relation_tasks(tasks: list[dict], question_text: str) -> list[dict]:
+    if not should_merge_enterprise_relation_tasks(question_text, tasks):
+        return tasks
+    merged: list[dict] = []
+    grouped: dict[tuple[tuple[str, ...], str], dict] = {}
+    order: list[tuple[tuple[str, ...], str]] = []
+    for task in tasks:
+        if task.get("task_type") == "summarize":
+            merged.append(task)
+            continue
+        entity_key = task_entity_key(task)
+        if not entity_key:
+            merged.append(task)
+            continue
+        key = (tuple(task.get("target_doc_ids") or []), entity_key)
+        if key not in grouped:
+            grouped[key] = {
+                "task": task.get("task", ""),
+                "task_type": "retrieve",
+                "target_doc_ids": task.get("target_doc_ids") or [],
+                "known_facts": list(task.get("known_facts") or []),
+                "search_slots": [],
+                "_task_names": [],
+            }
+            order.append(key)
+        group = grouped[key]
+        group["_task_names"].append(task.get("task", ""))
+        existing_facts = {(fact.get("slot"), fact.get("value")) for fact in group.get("known_facts") or []}
+        for fact in task.get("known_facts") or []:
+            fact_key = (fact.get("slot"), fact.get("value"))
+            if fact_key not in existing_facts:
+                group["known_facts"].append(fact)
+                existing_facts.add(fact_key)
+        seen_slots = {(slot.get("slot"), slot.get("query")) for slot in group.get("search_slots") or []}
+        for slot in task.get("search_slots") or []:
+            slot_key = (slot.get("slot"), slot.get("query"))
+            if slot_key not in seen_slots:
+                group["search_slots"].append(slot)
+                seen_slots.add(slot_key)
+    grouped_values = {id(value) for value in grouped.values()}
+    emitted_group_keys: set[tuple[tuple[str, ...], str]] = set()
+    final_tasks: list[dict] = []
+    for task in tasks:
+        if task.get("task_type") == "summarize" or id(task) not in grouped_values:
+            entity_key = task_entity_key(task)
+            key = (tuple(task.get("target_doc_ids") or []), entity_key)
+            if key in grouped and key not in emitted_group_keys:
+                group = grouped[key]
+                names = [name for name in group.pop("_task_names", []) if name]
+                if len(names) >= 2:
+                    group["task"] = "分别检索并核验是否同时满足：" + "；".join(names)[:100]
+                    group["relation_check"] = "各事实槽位可以来自不同段落；最终必须核验这些事实是否属于同一主体、案例、技术路径或应用场景之一。不同主体、不同领域或不同案例之间不得互相复用证据；不同公司不必然代表无关，但必须能共同说明同一技术路线在同一应用场景中的效果。关系核验不作为独立检索词。"
+                final_tasks.append(group)
+                emitted_group_keys.add(key)
+            elif task.get("task_type") == "summarize":
+                final_tasks.append(task)
+            elif key not in grouped:
+                final_tasks.append(task)
+    return final_tasks or tasks
+
+
+def enhance_enterprise_chat_search_slots(tasks: list[dict]) -> list[dict]:
+    for task in tasks:
+        for slot in task.get("search_slots") or []:
+            slot_text = maybe_fix_mojibake(str(slot.get("slot") or ""))
+            query_text = maybe_fix_mojibake(str(slot.get("query") or ""))
+            additions: list[str] = []
+            if any(term in slot_text + query_text for term in ("降本", "成本", "费用", "消耗")):
+                additions.extend(["成本", "效率", "材料", "节省", "功耗", "单位成本"])
+            if any(term in slot_text + query_text for term in ("性能", "提升", "优势", "质量")):
+                additions.extend(["性能", "速率", "精度", "强度", "可靠", "轻薄", "良率"])
+            if additions:
+                merged_query = " ".join([query_text] + [term for term in additions if term not in query_text])
+                slot["query"] = merged_query[:120]
+    return tasks
+
+
+def task_doc_match_text(task_name: str, known_facts: list[dict], raw_search_slots: list) -> str:
+    parts = [task_name]
+    for fact in known_facts or []:
+        if isinstance(fact, dict):
+            parts.append(str(fact.get("slot") or ""))
+            parts.append(str(fact.get("value") or ""))
+    for slot in raw_search_slots or []:
+        if isinstance(slot, dict):
+            parts.append(str(slot.get("slot") or ""))
+            parts.append(str(slot.get("query") or ""))
+    return maybe_fix_mojibake(compact_text(" ".join(part for part in parts if part)))
+
+
+def correct_enterprise_task_doc_ids(
+    task_name: str,
+    known_facts: list[dict],
+    raw_search_slots: list,
+    target_doc_ids: list[str],
+    default_doc_ids: list[str],
+) -> list[str]:
+    if not default_doc_ids:
+        return target_doc_ids
+    query = task_doc_match_text(task_name, known_facts, raw_search_slots)
+    base_scores = doc_hint_scores(query, default_doc_ids)
+    subject_terms = []
+    for fact in known_facts or []:
+        if not isinstance(fact, dict):
+            continue
+        slot = maybe_fix_mojibake(str(fact.get("slot") or "")).strip()
+        value = maybe_fix_mojibake(str(fact.get("value") or "")).strip()
+        if slot and value and any(marker in slot for marker in ("主体", "对象", "领域", "行业", "公司", "产品", "案例", "技术")):
+            subject_terms.append(value)
+            subject_terms.append(re.sub(r"(领域|行业|制造)$", "", value))
+    score_by_doc = {doc_id: [score, list(overlap)] for score, doc_id, overlap in base_scores}
+    matching_doc_ids: list[str] = []
+    for doc_id in default_doc_ids:
+        profile = maybe_fix_mojibake(doc_profile_text(doc_id, max_chars=1800))
+        for term in dict.fromkeys(term for term in subject_terms if term):
+            if term and term in profile:
+                if doc_id not in matching_doc_ids:
+                    matching_doc_ids.append(doc_id)
+                score_item = score_by_doc.setdefault(doc_id, [0.0, []])
+                score_item[0] += 14.0 if len(term) >= 3 else 8.0
+                if term not in score_item[1]:
+                    score_item[1].append(term)
+    candidate_pool = matching_doc_ids or list(default_doc_ids)
+    scored = sorted(
+        [(score, doc_id, overlap) for doc_id, (score, overlap) in score_by_doc.items() if doc_id in candidate_pool],
+        key=lambda row: row[0],
+        reverse=True,
+    )
+    if not scored:
+        return target_doc_ids
+    best_score, best_doc_id, _overlap = scored[0]
+    if best_score < 8.0:
+        return target_doc_ids
+    if len(target_doc_ids) <= 4:
+        current_scores = {doc_id: score for score, doc_id, _overlap in scored if doc_id in target_doc_ids}
+        current_best = max(current_scores.values(), default=0.0)
+        if best_doc_id in target_doc_ids and current_best >= best_score * 0.8:
+            return target_doc_ids
+        if current_best and best_score < max(current_best + 4.0, current_best * 1.35):
+            return target_doc_ids
+    corrected = [best_doc_id]
+    for score, doc_id, _overlap in scored[1:3]:
+        if score >= 12.0 and score >= best_score * 0.7 and doc_id not in corrected:
+            corrected.append(doc_id)
+    return corrected
+
+
+def task_prompt_payload(state: AgentState, task: dict) -> dict:
+    payload = dict(task)
+    if state.get("question", {}).get("enterprise_chat"):
+        payload["enterprise_chat_guidance"] = (
+            "核验证据时按当前槽位需要提取事实，不要求原文逐字出现问题中的抽象词。"
+            "例如成本下降、成本优势、效率提升、材料节省、功耗下降、单位成本下降可等价支持降本类槽位；"
+            "速率、精度、强度、轻薄、可靠性、良率、成活率、产蛋率等改善可支持性能提升类槽位。"
+            "对于“同时/均/都”类问题，不要求同一句话出现“同时”二字；A和B可以来自不同段落，"
+            "但必须先绑定主体/对象/领域/案例。只要事实属于同一主体、案例、技术路径或应用场景，即可视为有关联；"
+            "不同主体、不同领域或不同案例的证据不得互相替代。若题干列出多个并列主体，必须分别核验每个主体内部槽位。"
+            "不要仅因不同公司分别举例就判定不属于同一技术路径，也不要把一个主体的证据用于另一个主体。"
+        )
+    return payload
+
+
+def enforce_multi_target_doc_coverage(audit: dict, task: dict, evidence: list[dict]) -> dict:
+    if not audit.get("can_solve"):
+        return audit
+    if str(task.get("task_type") or "") != "retrieve":
+        return audit
+    target_doc_ids = list(dict.fromkeys(str(doc_id) for doc_id in task.get("target_doc_ids") or [] if doc_id))
+    if len(target_doc_ids) <= 1:
+        return audit
+
+    covered_doc_ids = {
+        str(item.get("doc_id") or "")
+        for item in evidence or []
+        if item.get("doc_id")
+    }
+    missing_doc_ids = [doc_id for doc_id in target_doc_ids if doc_id not in covered_doc_ids]
+    if not missing_doc_ids:
+        return audit
+
+    search_slots = [slot for slot in task.get("search_slots") or [] if isinstance(slot, dict)]
+    fallback_slot = maybe_fix_mojibake(str(task.get("task") or "目标文档事实")).strip()
+    fallback_query = " ".join(
+        maybe_fix_mojibake(str(slot.get("query") or slot.get("slot") or "")).strip()
+        for slot in search_slots[:2]
+    ).strip() or fallback_slot
+
+    missing_slots = list(audit.get("missing_slots") or [])
+    for doc_id in missing_doc_ids:
+        missing_slots.append(
+            {
+                "slot": fallback_slot,
+                "target_doc_ids": [doc_id],
+                "followup_query": fallback_query,
+            }
+        )
+    audit["can_solve"] = False
+    audit["missing_slots"] = missing_slots
+    audit["failure_analysis"] = audit.get("failure_analysis") or {
+        "reason": "当前多文档任务只覆盖了部分目标文档，不能用一个文档的证据推断其他文档。",
+        "next_action": "继续检索未覆盖目标文档",
+        "avoid_titles": [],
+    }
+    return audit
+
+
+def normalize_task_reasoning_plan(
+    plan: dict,
+    default_doc_ids: list[str],
+    doc_aliases: dict[str, str] | None = None,
+    question_text: str = "",
+    enterprise_chat: bool = False,
+) -> list[dict]:
     tasks: list[dict] = []
     for item in plan.get("tasks") or []:
         if not isinstance(item, dict):
@@ -3012,6 +3561,18 @@ def normalize_task_reasoning_plan(plan: dict, default_doc_ids: list[str], doc_al
             )
         if not search_slots:
             search_slots.append({"slot": task_name[:80], "target_doc_ids": target_doc_ids, "query": task_name[:120]})
+        if enterprise_chat and task_type != "summarize":
+            corrected_doc_ids = correct_enterprise_task_doc_ids(
+                task_name,
+                known_facts,
+                item.get("search_slots") or item.get("slots") or [],
+                target_doc_ids,
+                default_doc_ids,
+            )
+            if corrected_doc_ids != target_doc_ids:
+                target_doc_ids = corrected_doc_ids
+                for slot in search_slots:
+                    slot["target_doc_ids"] = target_doc_ids
         tasks.append(
             {
                 "task": task_name[:120],
@@ -3037,6 +3598,9 @@ def normalize_task_reasoning_plan(plan: dict, default_doc_ids: list[str], doc_al
                 ],
             }
         )
+    if enterprise_chat:
+        tasks = enhance_enterprise_chat_search_slots(tasks)
+        tasks = merge_enterprise_relation_tasks(tasks, question_text)
     return tasks
 
 
@@ -3049,7 +3613,7 @@ def build_task_reasoning_audit_prompt(
 ) -> tuple[str, str]:
     return build_task_reasoning_audit_prompt_text(
         maybe_fix_mojibake(state["question"]["question"]),
-        json.dumps(task, ensure_ascii=False, indent=2),
+        json.dumps(task_prompt_payload(state, task), ensure_ascii=False, indent=2),
         format_memory_slots(task_memory),
         format_evidence_notes(evidence_notes or []),
         format_evidence(evidence[-2:] if evidence_notes else evidence, max_chars=1600 if evidence_notes else 5000),
@@ -3057,28 +3621,54 @@ def build_task_reasoning_audit_prompt(
 
 
 def build_task_reasoning_result_prompt(state: AgentState, task: dict, task_memory: list[dict], audit: dict) -> tuple[str, str]:
-    return build_task_reasoning_result_prompt_text(
+    system, user = build_task_reasoning_result_prompt_text(
         maybe_fix_mojibake(state["question"]["question"]),
-        json.dumps(task, ensure_ascii=False, indent=2),
+        json.dumps(task_prompt_payload(state, task), ensure_ascii=False, indent=2),
         format_memory_slots(task_memory),
         json.dumps(audit, ensure_ascii=False),
     )
+    if state["question"].get("enterprise_chat"):
+        system += (
+            "企业问答金额计算补充规则：如果证据给出公式、年度区间比例、账户价值构成或变量定义，"
+            "且题干已经给出对应变量数值，必须代入计算；不要因为题干没有直接给出最终名词金额就blocked。"
+            "金额变量可以通过定义等价使用，例如题干给出累计所交、账户收益、账户价值、费用分项、比例分项时，"
+            "应结合证据公式判断是否足以计算目标金额。"
+            "企业问答多主体补充规则：已确认事实或证据笔记中若包含主体/对象/领域/案例，"
+            "只能用于同一主体下的当前任务；不得把A主体的事实用于B主体。"
+            "若当前任务要求分别判断多个主体，result或basis必须按主体列出，不得用一个主体的证据概括全部主体。"
+        )
+    return system, user
 
 
 def build_task_reasoning_final_prompt(state: AgentState, task_results: list[dict]) -> tuple[str, str]:
     option_claims = build_option_claims(state["question"])
     answer_format = str(state["question"].get("answer_format") or "").strip().lower()
-    if answer_format == "free":
+    if state["question"].get("enterprise_chat"):
+        answer_instruction = '"answer": "面向用户的中文回答。先直接回答结论，再列出关键依据；如果子任务已确认等价事实，不要因为原文未逐字出现抽象词或未写同时二字而推翻；如果证据不足，明确说明缺少哪些信息；不要输出选项字母"'
+    elif answer_format == "free":
         answer_instruction = '"answer": "按题干要求填写最终答案；只填数字、日期、排序或文本本身，不要输出选项字母或解释"'
     else:
         answer_instruction = '"answer": "A/B/C/D"'
-    return build_task_reasoning_final_prompt_text(
+    system, user = build_task_reasoning_final_prompt_text(
         maybe_fix_mojibake(state["question"]["question"]),
         reasoning_options_text(state["question"]),
         json.dumps(option_claims, ensure_ascii=False, indent=2),
         json.dumps(task_results, ensure_ascii=False, indent=2),
         answer_instruction,
     )
+    if state["question"].get("enterprise_chat"):
+        system += (
+            "企业问答最终汇总补充规则：如果某个任务被标记blocked，但其evidence_notes、formula、basis或题干事实"
+            "已经同时包含公式和变量数值，必须重新代入计算，不要沿用blocked结论。"
+            "汇总金额时，应把各子任务已完成的result相加；若某子任务只是缺少最终名词金额，"
+            "但已给出可计算公式和变量数值，不得判为缺失。"
+            "多主体最终汇总规则：如果问题包含多个并列主体/对象/领域/案例，必须逐个主体汇总其内部槽位。"
+            "只有同一主体下的证据才能支持该主体结论；不得把一个主体的技术、案例、降本或性能证据复用于另一个主体。"
+            "若某主体缺少任何关键槽位，应明确写该主体证据不足，而不是用其他主体补齐。"
+            "如果某个任务的evidence_notes写明当前主体未涉及、无关、不能支持或不能用于回答，"
+            "即使该任务result声称complete，也必须按证据不足处理，不得给出肯定结论。"
+        )
+    return system, user
 
 
 CHINESE_DIGIT_MAP = {
@@ -3688,7 +4278,13 @@ def human_toc_reasoning_node(state: AgentState) -> AgentState:
     else:
         plan, usage = call_qwen_json(system, user)
         add_usage(state, usage)
-    tasks = normalize_task_reasoning_plan(plan, state.get("doc_ids", []), state.get("doc_aliases", {}))
+    tasks = normalize_task_reasoning_plan(
+        plan,
+        state.get("doc_ids", []),
+        state.get("doc_aliases", {}),
+        question_text=state["question"].get("question", ""),
+        enterprise_chat=bool(state["question"].get("enterprise_chat")),
+    )
     task_results: list[dict] = []
     all_memory: list[dict] = []
     task_debug: dict = {"plan": plan, "tasks": [], "path": "human_toc"}
@@ -3801,6 +4397,7 @@ def human_toc_reasoning_node(state: AgentState) -> AgentState:
                 audit, usage = call_qwen_json(system, user)
                 add_usage(state, usage)
             audit = enforce_reference_missing_slots(audit, task_evidence, task)
+            audit = enforce_multi_target_doc_coverage(audit, task, task_evidence)
             raw_filled_slots = audit.get("filled_slots") or []
             filtered_filled_slots = filter_task_audit_slots(raw_filled_slots)
             task_memory = merge_memory_slots(task_memory, filtered_filled_slots)
@@ -4116,6 +4713,8 @@ def human_toc_reasoning_node(state: AgentState) -> AgentState:
         if not task_result.get("task"):
             task_result["task"] = task.get("task", "")
         task_result["evidence_notes"] = compact_evidence_notes_for_final(task_evidence_notes)
+        if state["question"].get("enterprise_chat"):
+            task_result = enforce_task_result_subject_binding(task_result, task)
         task_results.append(task_result)
         all_memory.extend(task_memory)
         task_log["result"] = task_result
@@ -4213,6 +4812,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 

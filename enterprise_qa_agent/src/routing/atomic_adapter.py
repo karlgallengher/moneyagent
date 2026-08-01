@@ -169,3 +169,41 @@ def atomic_to_legacy_question(
         )
     return base
 
+
+def chat_to_legacy_question(
+    query: str,
+    domain: str,
+    target_qid: str,
+    all_doc_ids: list[str],
+    doc_profile_fn: Callable[[str], str],
+    tree_doc_by_id: dict[str, dict],
+) -> dict:
+    query_text = maybe_fix_mojibake(str(query or "")).strip()
+    tokens = [token for token in dict.fromkeys(tokenize(query_text)) if is_doc_hint_token(token)]
+    atomic = {
+        "atomic_id": target_qid,
+        "question": query_text,
+        "domain": domain,
+        "task_type": "chat_qa",
+        "entities": tokens[:12],
+        "metrics": [],
+        "constraints": [],
+        "source_trace": {"original_question": query_text},
+    }
+    doc_ids = enterprise_prefilter_doc_ids(atomic, all_doc_ids, doc_profile_fn, tree_doc_by_id)
+    return {
+        "qid": target_qid,
+        "question": query_text,
+        "domain": domain,
+        "split": "chat",
+        "type": "计算题",
+        "answer_format": "free",
+        "options": {},
+        "doc_ids": doc_ids,
+        "enterprise_atomic": atomic,
+        "enterprise_task_type": "chat_qa",
+        "enterprise_domain": domain,
+        "enterprise_prefiltered_doc_ids": doc_ids,
+        "enterprise_chat": True,
+    }
+

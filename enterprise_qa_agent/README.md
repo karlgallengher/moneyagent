@@ -94,3 +94,33 @@ Outputs:
 
 - debug logs: `enterprise_qa_agent/outputs/debug/`
 - JSONL results: `enterprise_qa_agent/outputs/results/enterprise_results.jsonl`
+
+## Mature-Path Chat QA Agent
+
+The conversational QA entry reuses the mature old-path LangGraph rather than
+the lightweight chat prototype. It adapts a user question into a free-form
+legacy question, keeps the mature document routing, slot planning, evidence
+search, audit, follow-up retrieval, and final reasoning flow.
+
+Edit the question in code:
+
+```text
+enterprise_qa_agent/scripts/enterprise_chat_agent.py
+```
+
+Change:
+
+```python
+CHAT_QUERY = "..."
+CHAT_DOMAIN = ""  # empty means auto route
+```
+
+Run:
+
+```powershell
+D:\vscode\Projects\AFAC\venv\Scripts\python.exe D:\vscode\Projects\AFAC\enterprise_qa_agent\scripts\enterprise_chat_agent.py
+```
+
+Outputs:
+
+- debug logs: `enterprise_qa_agent/outputs/chat_debug/`

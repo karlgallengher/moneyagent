@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 # Edit this when you want to run a different atomic question from code.
-TARGET_ATOMIC_ID = "reg_a_019_A"
+TARGET_ATOMIC_ID = "fin_a_009_B"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
