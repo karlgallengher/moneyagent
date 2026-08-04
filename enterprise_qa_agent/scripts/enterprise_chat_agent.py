@@ -374,9 +374,15 @@ def rerank_chat_docs_with_llm(query: str, question: dict, legacy_agent) -> dict:
     return question
 
 
-def main() -> None:
-    query = os.environ.get("CHAT_QUERY", CHAT_QUERY).strip()
-    requested_domain = os.environ.get("CHAT_DOMAIN", CHAT_DOMAIN).strip()
+def run_chat_query(
+    query: str,
+    requested_domain: str = "",
+    preferred_doc_ids: list[str] | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    query = query.strip()
+    requested_domain = (requested_domain or "").strip()
+    preferred_doc_ids = list(dict.fromkeys(preferred_doc_ids or []))
     catalog_hits: list[dict] = []
     if requested_domain in DOMAIN_PAGE_INDEX_PATHS:
         domain = requested_domain
@@ -385,7 +391,10 @@ def main() -> None:
         domain = str(catalog_hits[0]["domain"]) if catalog_hits else infer_domain(query, requested_domain)
 
     os.environ["PAGE_INDEX_PATH"] = DOMAIN_PAGE_INDEX_PATHS[domain]
-    os.environ.setdefault("OUTPUT_DIR", "enterprise_qa_agent/outputs/chat_debug")
+    if output_dir:
+        os.environ["OUTPUT_DIR"] = output_dir
+    else:
+        os.environ.setdefault("OUTPUT_DIR", "enterprise_qa_agent/outputs/chat_debug")
     os.environ.setdefault("ENTERPRISE_DOC_TOP_K", "12")
 
     from enterprise_qa_agent.src import legacy_agent
@@ -400,12 +409,17 @@ def main() -> None:
         legacy_agent.TREE_DOC_BY_ID,
     )
     all_domain_doc_ids = legacy_agent.all_doc_ids_for_loaded_index()
+    valid_preferred_doc_ids = [doc_id for doc_id in preferred_doc_ids if doc_id in legacy_agent.TREE_DOC_BY_ID]
     domain_catalog_doc_ids = [
         str(item["doc_id"])
         for item in catalog_hits
         if item.get("domain") == domain and str(item.get("doc_id") or "") in legacy_agent.TREE_DOC_BY_ID
     ]
-    if domain_catalog_doc_ids and strong_catalog_hit(catalog_hits):
+    if valid_preferred_doc_ids:
+        question["doc_ids"] = valid_preferred_doc_ids
+        question["enterprise_prefiltered_doc_ids"] = valid_preferred_doc_ids
+        question["enterprise_session_preferred_doc_ids"] = valid_preferred_doc_ids
+    elif domain_catalog_doc_ids and strong_catalog_hit(catalog_hits):
         domain_catalog_doc_ids = list(dict.fromkeys(domain_catalog_doc_ids))[: int(os.environ.get("ENTERPRISE_DOC_TOP_K", "12"))]
         question["doc_ids"] = domain_catalog_doc_ids
         question["enterprise_prefiltered_doc_ids"] = domain_catalog_doc_ids
@@ -431,6 +445,13 @@ def main() -> None:
     print(f"status={final_state.get('status')}")
     print(f"token_usage={json.dumps(final_state.get('token_usage', {}), ensure_ascii=False)}")
     legacy_agent.write_outputs(final_state, os.environ["OUTPUT_DIR"])
+    return final_state
+
+
+def main() -> None:
+    query = os.environ.get("CHAT_QUERY", CHAT_QUERY).strip()
+    requested_domain = os.environ.get("CHAT_DOMAIN", CHAT_DOMAIN).strip()
+    run_chat_query(query, requested_domain)
 
 
 if __name__ == "__main__":

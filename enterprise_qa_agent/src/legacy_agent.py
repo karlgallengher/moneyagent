@@ -3083,10 +3083,48 @@ def text_has_any_subject_term(text: str, subject_terms: list[str]) -> bool:
     return any(term and term in fixed for term in subject_terms)
 
 
+def task_has_document_subject(task: dict) -> bool:
+    doc_markers = (
+        "研报", "报告", "年报", "半年报", "季报", "条款", "办法", "规定", "规则", "通知",
+        "合同", "公告", "说明书", "文件", "文档", "招股书", "募集说明书", "重组报告书",
+    )
+    task_name = maybe_fix_mojibake(str(task.get("task") or ""))
+    if any(marker in task_name for marker in doc_markers):
+        return True
+    for fact in task.get("known_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        slot = maybe_fix_mojibake(str(fact.get("slot") or ""))
+        value = maybe_fix_mojibake(str(fact.get("value") or ""))
+        if ("文档" in slot or "文件" in slot or "报告" in slot or "题名" in slot or "标题" in slot) and value:
+            return True
+        if any(marker in value for marker in doc_markers):
+            return True
+    return False
+
+
+def task_result_has_target_doc_evidence(task_result: dict, task: dict) -> bool:
+    target_doc_ids = {str(doc_id) for doc_id in task.get("target_doc_ids") or [] if doc_id}
+    if not target_doc_ids:
+        return False
+    for note in task_result.get("evidence_notes") or []:
+        if not isinstance(note, dict):
+            continue
+        if str(note.get("doc_id") or "") in target_doc_ids:
+            return True
+    for evidence_id in task_result.get("evidence_ids") or []:
+        evidence_text = str(evidence_id or "")
+        if any(evidence_text.startswith(f"{doc_id}_") or evidence_text == doc_id for doc_id in target_doc_ids):
+            return True
+    return False
+
+
 def result_has_subject_mismatch(task_result: dict, task: dict) -> bool:
     subject_terms = task_subject_terms(task)
     if not subject_terms:
         return False
+    has_target_doc_evidence = task_result_has_target_doc_evidence(task_result, task)
+    is_document_subject = task_has_document_subject(task)
     result_text = maybe_fix_mojibake(
         " ".join(
             str(part or "")
@@ -3115,13 +3153,32 @@ def result_has_subject_mismatch(task_result: dict, task: dict) -> bool:
         "证据不足",
         "无法支持",
     )
-    if any(marker in combined for marker in mismatch_markers) and not text_has_any_subject_term(result_text, subject_terms):
+    hard_mismatch_markers = (
+        "与当前任务无关",
+        "与该领域无关",
+        "非当前领域",
+        "不属于当前领域",
+        "不能用于",
+        "不能互相替代",
+    )
+    if (
+        any(marker in combined for marker in hard_mismatch_markers)
+        and not text_has_any_subject_term(result_text, subject_terms)
+    ):
+        return True
+    if (
+        any(marker in combined for marker in mismatch_markers)
+        and not text_has_any_subject_term(result_text, subject_terms)
+        and not (is_document_subject and has_target_doc_evidence)
+    ):
         return True
     subject_note_lines = [line for line in re.split(r"[。\n；;]+", notes_text) if "主体=" in line]
     for line in subject_note_lines:
         if text_has_any_subject_term(line, subject_terms) and any(marker in line for marker in mismatch_markers):
             return True
     if subject_note_lines and not any(text_has_any_subject_term(line, subject_terms) for line in subject_note_lines):
+        if is_document_subject and has_target_doc_evidence:
+            return False
         return True
     if "已确认事实" in result_text and any(marker in notes_text for marker in mismatch_markers):
         return True

@@ -124,3 +124,64 @@ D:\vscode\Projects\AFAC\venv\Scripts\python.exe D:\vscode\Projects\AFAC\enterpri
 Outputs:
 
 - debug logs: `enterprise_qa_agent/outputs/chat_debug/`
+
+## Multi-Turn Chat Session
+
+The multi-turn wrapper keeps the mature single-turn QA path unchanged and adds
+a local SQLite memory layer around it. SQLite stores conversation memory only;
+document indexes and evidence text still come from the existing retrieval path.
+
+Edit:
+
+```text
+enterprise_qa_agent/scripts/enterprise_chat_session.py
+```
+
+Change session settings if needed:
+
+```python
+SESSION_ID = "default"
+CHAT_DOMAIN = ""  # empty means auto route
+RESET_SESSION = False
+```
+
+Run, then type questions in the terminal:
+
+```powershell
+D:\vscode\Projects\AFAC\venv\Scripts\python.exe D:\vscode\Projects\AFAC\enterprise_qa_agent\scripts\enterprise_chat_session.py
+```
+
+Commands inside the chat:
+
+```text
+/reset  clear the current session
+exit    stop the chat
+```
+
+Session state is saved to:
+
+```text
+enterprise_qa_agent/outputs/chat_sessions/chat_sessions.sqlite3
+```
+
+Tables:
+
+- `sessions`: active domain/docs/subjects and the long-term compressed summary.
+- `turns`: every user query, resolved query, answer, routed docs, and token usage.
+- `facts`: compact facts extracted from completed or partial reasoning tasks.
+- `evidence_memory`: useful/partial evidence ids with doc, subject, slot, and compressed summaries for same-scope or expanded follow-ups.
+
+At runtime the wrapper first sends the user input plus compact memory to a
+lightweight LLM router. If the router can answer directly, the answer is saved
+to SQLite and retrieval is skipped. If the router is unsure or the question
+needs enterprise evidence, it enters the mature RAG path. The router also
+classifies retrieval scope:
+
+- `active_docs_only`: same-scope follow-up; reuse active documents.
+- `active_docs_plus_new_search`: expanded comparison; keep remembered subjects
+  in the rewritten query but allow new document routing.
+- `fresh_search`: standalone or topic-switching question; route from scratch.
+
+The RAG path receives only a compact memory view: the long-term summary, the
+latest few turns, and recent extracted facts.
+
