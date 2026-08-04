@@ -29,6 +29,49 @@ evidence-grounded enterprise QA results.
 - `ranking`: produce an ordered result.
 - `rule_applicability`: verify whether a rule applies to a situation.
 
+## Project Structure and Data Placement
+
+代码可以直接从 GitHub clone；原始 md 数据和生成后的 `processed/` 索引不建议提交到 GitHub。
+重新配置环境时，把原始 md 解压到仓库根目录下的固定位置：
+
+```text
+AFAC/
+  public_dataset_upload/
+    raw_md/
+      financial_contracts/
+      financial_reports/
+      insurance/
+      regulatory/
+      research/
+  processed/
+    page_index_financial_contracts/
+    page_index_financial_reports/
+    page_index_insurance/
+    page_index_regulatory/
+    page_index_research/
+  enterprise_qa_agent/
+  scripts/
+    build_page_index.py
+    build_all_page_indexes.py
+```
+
+放好原始 md 后，在仓库根目录运行一键构建：
+
+```powershell
+.\venv\Scripts\python.exe .\scripts\build_all_page_indexes.py
+```
+
+构建完成后，企业 agent 会读取这些索引：
+
+- `processed/page_index_financial_contracts/page_index.jsonl`
+- `processed/page_index_financial_reports/page_index.jsonl`
+- `processed/page_index_insurance/page_index.jsonl`
+- `processed/page_index_regulatory/page_index.jsonl`
+- `processed/page_index_research/page_index.jsonl`
+
+如果只更新了某一个 domain 的原始 md，可以直接改用 `scripts/build_page_index.py`
+单独构建；通常情况下用 `build_all_page_indexes.py` 即可。
+
 ## First Step
 
 Generate atomic questions:
