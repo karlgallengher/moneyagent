@@ -16,6 +16,7 @@ __pycache__/
 
 # Generated outputs and debug logs
 processed/
+public_dataset_upload/
 enterprise_qa_agent/outputs/
 enterprise_qa_agent/data/atomic_questions/
 *.log

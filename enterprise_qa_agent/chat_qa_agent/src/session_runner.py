@@ -50,7 +50,7 @@ def run_one_turn(conn: sqlite3.Connection, session_id: str, requested_domain: st
     if handle_direct_answer(conn, session_id, query, route):
         return
 
-    from enterprise_qa_agent.scripts.enterprise_chat_agent import run_chat_query
+    from enterprise_qa_agent.src.chat.runner import run_chat_query
 
     route_for_memory = dict(route)
     route_for_memory["current_query"] = query
