@@ -17,7 +17,7 @@ DEFAULT_QUERY = "请概括这个金融知识库可以回答哪些类型的问题
 DEFAULT_EVAL_SET = "tests/eval_sets/moneyagent_research_20_cn.jsonl"
 
 # VSCode click-run defaults. Edit these values, then click Run.
-# RUN_MODE: "chat", "session", or "eval"
+# RUN_MODE: "chat", "session", "eval", or "mcp"
 RUN_MODE = "eval"
 RUN_QUERY = DEFAULT_QUERY
 RUN_DOMAIN = ""
@@ -100,6 +100,12 @@ def run_eval(args: argparse.Namespace) -> None:
         sys.argv = old_argv
 
 
+def run_mcp(args: argparse.Namespace) -> None:
+    script = REPO_ROOT / "scripts" / "mcp_server.py"
+    print("Starting MoneyAgent MCP server over stdio...")
+    runpy.run_path(str(script), run_name="__main__")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified entrypoint for MoneyAgent.",
@@ -135,6 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--include-raw-state", action="store_true")
     eval_parser.set_defaults(func=run_eval)
 
+    mcp_parser = subparsers.add_parser("mcp", help="Run the MoneyAgent MCP stdio server.")
+    mcp_parser.set_defaults(func=run_mcp)
+
     return parser
 
 
@@ -162,6 +171,8 @@ def default_args_for_click_run() -> list[str]:
         else:
             args.extend(["--case-index", str(RUN_CASE_INDEX)])
         return args
+    if RUN_MODE == "mcp":
+        return ["mcp"]
     raise SystemExit(f"Unsupported RUN_MODE: {RUN_MODE}")
 
 

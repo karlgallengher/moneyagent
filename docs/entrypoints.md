@@ -25,7 +25,7 @@ python .\scripts\run_moneyagent.py session --session-id default --reset
 Run one turn through the session memory stack:
 
 ```powershell
-python .\scripts\run_moneyagent.py session -q "上一轮提到的两个产品，哪个免赔额更宽松？" --domain insurance
+python .\scripts\run_moneyagent.py session -q "上一轮提到的两个产品，哪一个免赔额更宽松？" --domain insurance
 ```
 
 ## Evaluation
@@ -55,6 +55,20 @@ enterprise_qa_agent/outputs/eval/moneyagent_eval_results.jsonl
 enterprise_qa_agent/outputs/eval/moneyagent_eval_results_summary.json
 enterprise_qa_agent/outputs/eval/moneyagent_eval_results_all_cases.jsonl
 enterprise_qa_agent/outputs/eval/moneyagent_eval_results_all_cases_summary.json
+```
+
+## MCP Server
+
+Run the MCP stdio server:
+
+```powershell
+python .\scripts\run_moneyagent.py mcp
+```
+
+For VSCode click-run, edit the constants near the top of `scripts/run_moneyagent.py`:
+
+```python
+RUN_MODE = "mcp"
 ```
 
 ## Legacy Entrypoints
