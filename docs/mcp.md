@@ -5,6 +5,12 @@ MoneyAgent exposes a small MCP tool layer for document research and deterministi
 ## Tools
 
 ```text
+list_domains_tool
+```
+
+List all available domains and index health.
+
+```text
 search_docs_tool
 ```
 
@@ -23,6 +29,12 @@ get_page_tool
 Fetch one indexed page by `page_id` or `doc_id`.
 
 ```text
+get_doc_outline_tool
+```
+
+Fetch one document's metadata and heading outline.
+
+```text
 calculate_finance_tool
 ```
 
@@ -36,6 +48,12 @@ yoy_reverse
 bond_interest
 deductible_claim
 ```
+
+```text
+ask_moneyagent_tool
+```
+
+Ask the full MoneyAgent workflow and return the final answer, selected domain, document ids, evidence, and token usage.
 
 ## Run
 
@@ -58,6 +76,12 @@ python .\scripts\run_moneyagent.py mcp
 ```
 
 The server uses stdio transport through MCP, so it is meant to be launched by an MCP-compatible client.
+
+Smoke test the MCP tool layer without starting a stdio server:
+
+```powershell
+python .\scripts\mcp_smoke_test.py
+```
 
 ## Example Tool Inputs
 
@@ -92,5 +116,16 @@ Calculate bond interest:
     "rate": 0.015,
     "days": 120
   }
+}
+```
+
+Ask MoneyAgent:
+
+```json
+{
+  "query": "平安e生保的家庭共享免赔额规则是什么？",
+  "domain": "insurance",
+  "preferred_doc_ids": ["5"],
+  "include_raw_state": false
 }
 ```

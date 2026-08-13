@@ -69,6 +69,10 @@ def _catalog_text(row: dict[str, Any]) -> str:
     )
 
 
+def _doc_title(row: dict[str, Any]) -> str:
+    return _text(row.get("title_fixed") or row.get("title"))
+
+
 def _term_hits(query: str, text: str, max_hits: int = 12) -> list[str]:
     terms = list(dict.fromkeys(tokenize(query)))
     lowered = text.lower()
@@ -140,7 +144,7 @@ def search_docs(query: str, domain: str, top_k: int = 5) -> dict[str, Any]:
             {
                 "domain": domain,
                 "doc_id": doc_id,
-                "title": _text(row.get("title_fixed") or row.get("title")),
+                "title": _doc_title(row),
                 "score": round(score, 3),
                 "catalog_score": round(catalog_score, 3),
                 "page_score": round(page_score, 3),
@@ -152,6 +156,78 @@ def search_docs(query: str, domain: str, top_k: int = 5) -> dict[str, Any]:
         )
     scored.sort(key=lambda item: item["score"], reverse=True)
     return {"query": query, "domain": domain, "results": scored[:top_k]}
+
+
+def list_domains() -> dict[str, Any]:
+    results = []
+    for domain, relative_dir in DOMAIN_INDEX_DIRS.items():
+        domain_dir = REPO_ROOT / relative_dir
+        catalog_rows = _catalog(domain)
+        page_rows = _pages(domain)
+        results.append(
+            {
+                "domain": domain,
+                "index_dir": relative_dir,
+                "catalog_path": str(domain_dir / "doc_catalog.jsonl"),
+                "page_index_path": str(domain_dir / "page_index.jsonl"),
+                "catalog_exists": (domain_dir / "doc_catalog.jsonl").exists(),
+                "page_index_exists": (domain_dir / "page_index.jsonl").exists(),
+                "doc_count": len(catalog_rows),
+                "page_count": len(page_rows),
+            }
+        )
+    return {"domains": results}
+
+
+def get_doc_outline(domain: str, doc_id: str, max_headings: int = 80) -> dict[str, Any]:
+    domain = _resolve_domain(domain)
+    doc_id = str(doc_id or "").strip()
+    max_headings = max(1, min(int(max_headings or 80), 300))
+    if not doc_id:
+        raise ValueError("doc_id is required")
+
+    catalog_row = None
+    for row in _catalog(domain):
+        if str(row.get("doc_id") or "") == doc_id:
+            catalog_row = row
+            break
+    if catalog_row is None:
+        raise ValueError(f"doc not found: domain={domain} doc_id={doc_id}")
+
+    headings: list[dict[str, Any]] = []
+    seen = set()
+    doc_pages = []
+    for page in _pages(domain):
+        if str(page.get("doc_id") or "") != doc_id:
+            continue
+        doc_pages.append(page)
+        heading_path = page.get("heading_path") or []
+        key = json.dumps(heading_path, ensure_ascii=False)
+        if heading_path and key not in seen:
+            seen.add(key)
+            headings.append(
+                {
+                    "page_id": str(page.get("page_id") or ""),
+                    "heading_path": heading_path,
+                }
+            )
+        if len(headings) >= max_headings:
+            break
+
+    aliases = catalog_row.get("aliases") or []
+    top_headings = catalog_row.get("top_headings") or []
+    return {
+        "domain": domain,
+        "doc_id": doc_id,
+        "title": _doc_title(catalog_row),
+        "aliases": [_text(item) for item in aliases],
+        "page_count": catalog_row.get("page_count") or len(doc_pages),
+        "first_page_id": catalog_row.get("first_page_id"),
+        "first_page_preview": _clip_text(_text(catalog_row.get("first_page_preview")), 500),
+        "top_headings": [_text(item) for item in top_headings],
+        "headings": headings,
+        "headings_truncated": len(headings) >= max_headings,
+    }
 
 
 def search_pages(
