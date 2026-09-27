@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -23,9 +24,11 @@ from enterprise_qa_agent.src.chat.catalog_router import (
     DOMAIN_PAGE_INDEX_PATHS,
     cross_domain_catalog_search,
     infer_domain,
+    refresh_domain_paths,
     rerank_chat_docs_with_llm,
     strong_catalog_hit,
 )
+from enterprise_qa_agent.src.chat.domain_registry import INDEX_LOCK
 
 def chat_qid(query: str) -> str:
     digest = hashlib.md5(query.encode("utf-8")).hexdigest()[:8]
@@ -39,10 +42,23 @@ def run_chat_query(
     preferred_doc_ids: list[str] | None = None,
     output_dir: str | None = None,
 ) -> dict:
+    with INDEX_LOCK:
+        return _run_chat_query(query, requested_domain, preferred_doc_ids, output_dir)
+
+
+def _run_chat_query(
+    query: str,
+    requested_domain: str = "",
+    preferred_doc_ids: list[str] | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    refresh_domain_paths()
     query = query.strip()
     requested_domain = (requested_domain or "").strip()
     preferred_doc_ids = list(dict.fromkeys(preferred_doc_ids or []))
     catalog_hits: list[dict] = []
+    if requested_domain and requested_domain not in DOMAIN_PAGE_INDEX_PATHS:
+        raise ValueError(f"领域不可检索或尚未构建: {requested_domain}")
     if requested_domain in DOMAIN_PAGE_INDEX_PATHS:
         domain = requested_domain
     else:
@@ -57,6 +73,11 @@ def run_chat_query(
     os.environ.setdefault("ENTERPRISE_DOC_TOP_K", "12")
 
     from enterprise_qa_agent.src import legacy_agent
+    desired_path = DOMAIN_PAGE_INDEX_PATHS[domain]
+    index_mtime = Path(desired_path).stat().st_mtime_ns
+    if legacy_agent.PAGE_INDEX_PATH != desired_path or getattr(legacy_agent, "_INDEX_MTIME", None) != index_mtime:
+        legacy_agent = importlib.reload(legacy_agent)
+    legacy_agent._INDEX_MTIME = index_mtime
 
     qid = os.environ.get("CHAT_QID", chat_qid(query))
     question = legacy_agent.chat_to_legacy_question(

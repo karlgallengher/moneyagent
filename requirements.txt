@@ -2,3 +2,6 @@ langgraph
 openai
 requests
 mcp
+fastapi
+python-multipart
+uvicorn

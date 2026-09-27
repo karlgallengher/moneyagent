@@ -7,6 +7,8 @@ from typing import Any
 from enterprise_qa_agent.src.io.output_utils import (
     enterprise_reason_from_state,
     evidence_summary_from_state,
+    facts_summary_from_state,
+    question_info_summary_from_state,
 )
 
 
@@ -28,10 +30,14 @@ class MoneyAgentResponse:
     domain: str
     doc_ids: list[str]
     evidence: list[dict[str, Any]]
+    facts: list[dict[str, Any]]
+    question_info: list[dict[str, Any]]
     reason: str
     confidence: float | None
     token_usage: dict[str, int]
     debug_files: dict[str, str]
+    error_type: str = ""
+    error_message: str = ""
     raw_state: dict[str, Any] | None = None
 
     def to_dict(self, include_raw_state: bool = False) -> dict[str, Any]:
@@ -80,6 +86,8 @@ def state_to_response(
         domain=str(question.get("enterprise_domain") or question.get("domain") or ""),
         doc_ids=[str(item) for item in question.get("enterprise_prefiltered_doc_ids") or question.get("doc_ids") or []],
         evidence=evidence_summary_from_state(state),
+        facts=facts_summary_from_state(state),
+        question_info=question_info_summary_from_state(state),
         reason=enterprise_reason_from_state(state),
         confidence=_confidence_from_state(state),
         token_usage={
@@ -98,16 +106,38 @@ def answer_question(
 ) -> MoneyAgentResponse:
     from enterprise_qa_agent.src.chat.runner import run_chat_query
 
-    final_state = run_chat_query(
-        request.query,
-        requested_domain=request.domain,
-        preferred_doc_ids=list(request.preferred_doc_ids),
-        output_dir=request.output_dir,
-    )
-    return state_to_response(
-        final_state,
-        query=request.query,
-        output_dir=request.output_dir,
-        include_raw_state=include_raw_state,
-    )
-
+    try:
+        final_state = run_chat_query(
+            request.query,
+            requested_domain=request.domain,
+            preferred_doc_ids=list(request.preferred_doc_ids),
+            output_dir=request.output_dir,
+        )
+        return state_to_response(
+            final_state,
+            query=request.query,
+            output_dir=request.output_dir,
+            include_raw_state=include_raw_state,
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        qid = str(request.query or "").strip()
+        return MoneyAgentResponse(
+            query=request.query,
+            qid=qid,
+            status="error",
+            answer="",
+            domain=str(request.domain or ""),
+            doc_ids=[],
+            evidence=[],
+            facts=[],
+            question_info=[],
+            reason="",
+            confidence=None,
+            token_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            debug_files=_debug_files(qid, request.output_dir),
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            raw_state=None,
+        )

@@ -17,9 +17,9 @@ DEFAULT_QUERY = "请概括这个金融知识库可以回答哪些类型的问题
 DEFAULT_EVAL_SET = "tests/eval_sets/moneyagent_research_20_cn.jsonl"
 
 # VSCode click-run defaults. Edit these values, then click Run.
-# RUN_MODE: "chat", "session", "eval", or "mcp"
-RUN_MODE = "eval"
-RUN_QUERY = DEFAULT_QUERY
+# RUN_MODE: "chat", "session", "eval", "mcp", or "web-api"
+RUN_MODE = "session"
+RUN_QUERY = ""
 RUN_DOMAIN = ""
 RUN_CASE_INDEX = 1
 RUN_CASE_ID = ""
@@ -106,6 +106,12 @@ def run_mcp(args: argparse.Namespace) -> None:
     runpy.run_path(str(script), run_name="__main__")
 
 
+def run_web_api(args: argparse.Namespace) -> None:
+    from scripts.web_api import main
+
+    main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified entrypoint for MoneyAgent.",
@@ -144,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_parser = subparsers.add_parser("mcp", help="Run the MoneyAgent MCP stdio server.")
     mcp_parser.set_defaults(func=run_mcp)
 
+    web_api_parser = subparsers.add_parser("web-api", help="Run the MoneyAgent FastAPI backend for the Web UI.")
+    web_api_parser.set_defaults(func=run_web_api)
+
     return parser
 
 
@@ -173,14 +182,24 @@ def default_args_for_click_run() -> list[str]:
         return args
     if RUN_MODE == "mcp":
         return ["mcp"]
+    if RUN_MODE == "web-api":
+        return ["web-api"]
     raise SystemExit(f"Unsupported RUN_MODE: {RUN_MODE}")
 
 
 def main() -> None:
-    parser = build_parser()
-    cli_args = sys.argv[1:] or default_args_for_click_run()
-    args = parser.parse_args(cli_args)
-    args.func(args)
+    try:
+        parser = build_parser()
+        cli_args = sys.argv[1:] or default_args_for_click_run()
+        args = parser.parse_args(cli_args)
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"error: {type(exc).__name__}: {exc}")
+        raise
 
 
 if __name__ == "__main__":

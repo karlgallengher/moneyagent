@@ -152,6 +152,7 @@ PAGE_INDEX_PATH = os.environ.get(
     "PAGE_INDEX_PATH",
     DOMAIN_PAGE_INDEX_PATHS.get(STARTUP_ATOMIC_DOMAIN, "processed/page_index_research/page_index.jsonl"),
 )
+_INDEX_MTIME = Path(PAGE_INDEX_PATH).stat().st_mtime_ns if Path(PAGE_INDEX_PATH).exists() else 0
 
 ANSWER_CSV = os.environ.get("ENTERPRISE_RESULT_JSONL", "enterprise_qa_agent/outputs/results/enterprise_results.jsonl")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "enterprise_qa_agent/outputs/debug")

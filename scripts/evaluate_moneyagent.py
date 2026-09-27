@@ -169,6 +169,9 @@ def print_case_detail(scored: dict[str, Any]) -> None:
     if response.get("doc_ids"):
         print("\n[Doc IDs]")
         print(", ".join(str(item) for item in response.get("doc_ids") or []))
+    if response.get("status") == "error":
+        print("\n[Error]")
+        print(f"{response.get('error_type', '')}: {response.get('error_message', '')}")
     print("=" * 80 + "\n")
 
 
@@ -208,10 +211,29 @@ def main() -> None:
     scored_rows: list[dict[str, Any]] = []
     for case in cases:
         started = time.perf_counter()
-        response = answer_question(
-            MoneyAgentRequest(query=str(case["question"]), domain=str(case.get("domain") or "")),
-            include_raw_state=args.include_raw_state,
-        ).to_dict(include_raw_state=args.include_raw_state)
+        try:
+            response = answer_question(
+                MoneyAgentRequest(query=str(case["question"]), domain=str(case.get("domain") or "")),
+                include_raw_state=args.include_raw_state,
+            ).to_dict(include_raw_state=args.include_raw_state)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            response = {
+                "query": str(case.get("question") or ""),
+                "qid": str(case.get("id") or ""),
+                "status": "error",
+                "answer": "",
+                "domain": str(case.get("domain") or ""),
+                "doc_ids": [],
+                "evidence": [],
+                "reason": "",
+                "confidence": None,
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "debug_files": {},
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
         elapsed = time.perf_counter() - started
         scored = score_case(case, response, elapsed)
         scored_rows.append(scored)

@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 
+from enterprise_qa_agent.src.chat.domain_registry import domain_index_dirs
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -15,6 +16,12 @@ DOMAIN_PAGE_INDEX_PATHS = {
     "regulatory": "processed/page_index_regulatory/page_index.jsonl",
     "research": "processed/page_index_research/page_index.jsonl",
 }
+
+def refresh_domain_paths() -> None:
+    DOMAIN_PAGE_INDEX_PATHS.clear()
+    DOMAIN_PAGE_INDEX_PATHS.update(
+        {domain: f"{directory}/page_index.jsonl" for domain, directory in domain_index_dirs().items()}
+    )
 
 
 DOMAIN_RULE_TERMS = {
@@ -179,6 +186,7 @@ def raw_catalog_route_score(query: str, item: dict) -> tuple[float, list[str]]:
 
 
 def cross_domain_catalog_search(query: str, top_k: int = 12) -> list[dict]:
+    refresh_domain_paths()
     results: list[dict] = []
     for domain, page_index_path in DOMAIN_PAGE_INDEX_PATHS.items():
         catalog_path = (REPO_ROOT / page_index_path).with_name("doc_catalog.jsonl")
@@ -273,6 +281,7 @@ def sort_candidate_docs_by_catalog(query: str, candidate_doc_ids: list[str], cat
 
 
 def infer_domain(query: str, requested: str) -> str:
+    refresh_domain_paths()
     requested = (requested or "").strip()
     if requested in DOMAIN_PAGE_INDEX_PATHS:
         return requested

@@ -107,6 +107,46 @@ def ensure_session(conn: sqlite3.Connection, session_id: str) -> None:
     conn.commit()
 
 
+def list_sessions(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT
+            s.session_id,
+            s.title,
+            s.active_domain,
+            s.created_at,
+            s.updated_at,
+            COUNT(t.id) AS turn_count,
+            MAX(t.created_at) AS last_turn_at
+        FROM sessions s
+        LEFT JOIN turns t ON t.session_id = s.session_id
+        GROUP BY s.session_id
+        ORDER BY s.updated_at DESC, s.created_at DESC
+        """
+    ).fetchall()
+    return [
+        {
+            "session_id": str(row["session_id"]),
+            "title": str(row["title"] or row["session_id"]),
+            "active_domain": str(row["active_domain"] or ""),
+            "turn_count": int(row["turn_count"] or 0),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["last_turn_at"] or row["updated_at"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def update_session_title(conn: sqlite3.Connection, session_id: str, title: str) -> None:
+    ensure_session(conn, session_id)
+    clean_title = safe_text(title, 80).strip() or session_id
+    conn.execute(
+        "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+        (clean_title, now_iso(), session_id),
+    )
+    conn.commit()
+
+
 def load_session_state(conn: sqlite3.Connection, session_id: str) -> dict:
     ensure_session(conn, session_id)
     session_row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()

@@ -23,17 +23,29 @@ from .router import route_input_intent
 from .utils import safe_text
 
 
-def handle_direct_answer(conn: sqlite3.Connection, session_id: str, query: str, route: dict) -> bool:
+def handle_direct_answer(
+    conn: sqlite3.Connection,
+    session_id: str,
+    requested_domain: str,
+    query: str,
+    route: dict,
+) -> dict | None:
     if str(route.get("route") or "") != "direct_answer":
-        return False
+        return None
     answer = safe_text(route.get("direct_answer"), 1200)
     if not answer:
-        return False
+        return None
     turn_index = save_local_turn(conn, session_id, query, answer, route.get("token_usage") or {})
     print(f"\n[router] route=direct_answer reason={route.get('reason', '')}")
     print(f"assistant> {answer}")
     print(f"[session] saved_turn={turn_index} direct_answer=True token_usage={json.dumps(route.get('token_usage') or {}, ensure_ascii=False)}")
-    return True
+    return {
+        "qid": f"session_{session_id}_{turn_index}",
+        "question": {"enterprise_domain": requested_domain},
+        "final_answer": answer,
+        "status": "done",
+        "token_usage": route.get("token_usage") or {},
+    }
 
 
 def print_startup(session_id: str, requested_domain: str) -> None:
@@ -43,12 +55,13 @@ def print_startup(session_id: str, requested_domain: str) -> None:
     print("Type a question and press Enter. Type exit, quit, or q to stop. Type /reset to clear this session.")
 
 
-def run_one_turn(conn: sqlite3.Connection, session_id: str, requested_domain: str, query: str) -> None:
+def run_one_turn(conn: sqlite3.Connection, session_id: str, requested_domain: str, query: str) -> dict:
     state = load_session_state(conn, session_id)
     deleted_cold = cleanup_cold_evidence_memory(conn, session_id, int(state.get("turn_count") or 0))
     route = route_input_intent(query, state)
-    if handle_direct_answer(conn, session_id, query, route):
-        return
+    direct_state = handle_direct_answer(conn, session_id, requested_domain, query, route)
+    if direct_state is not None:
+        return direct_state
 
     from enterprise_qa_agent.src.chat.runner import run_chat_query
 
@@ -102,6 +115,7 @@ def run_one_turn(conn: sqlite3.Connection, session_id: str, requested_domain: st
     maybe_update_global_summary(conn, session_id, turn_index)
     print(f"\nassistant> {final_state.get('final_answer', '')}")
     print(f"[session] saved_turn={turn_index} token_usage={json.dumps(final_state.get('token_usage', {}), ensure_ascii=False)}")
+    return final_state
 
 
 def main() -> None:

@@ -876,12 +876,12 @@ def write_page_preview(path: Path, pages: Iterable[dict]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
-def main() -> None:
-    input_path = Path(DEFAULT_INPUT).resolve()
-    output_dir = Path(DEFAULT_OUTPUT).resolve()
+def build_index(input_path: Path, output_dir: Path, split_mode: str = "heading", limit: int = 0) -> dict:
+    input_path = input_path.resolve()
+    output_dir = output_dir.resolve()
     files = list(dict.fromkeys(iter_input_files(input_path)))
-    if DEFAULT_LIMIT:
-        files = files[:DEFAULT_LIMIT]
+    if limit:
+        files = files[:limit]
 
     root = input_path if input_path.is_dir() else input_path.parent
     documents: list[dict] = []
@@ -894,7 +894,7 @@ def main() -> None:
             max_chars=DEFAULT_MAX_CHARS,
             overlap_chars=DEFAULT_OVERLAP_CHARS,
             fix_mojibake=DEFAULT_FIX_MOJIBAKE,
-            split_mode=DEFAULT_SPLIT_MODE,
+            split_mode=split_mode,
         )
         documents.append(doc)
         tocs.append(toc_doc)
@@ -913,6 +913,11 @@ def main() -> None:
     print(f"documents={len(documents)}")
     print(f"pages={len(pages)}")
     print(f"output_dir={output_dir}")
+    return {"file_count": len(files), "doc_count": len(documents), "page_count": len(pages)}
+
+
+def main() -> None:
+    build_index(Path(DEFAULT_INPUT), Path(DEFAULT_OUTPUT), DEFAULT_SPLIT_MODE, DEFAULT_LIMIT)
 
 
 if __name__ == "__main__":

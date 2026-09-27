@@ -223,9 +223,6 @@ def evidence_summary_from_state(state: dict, max_items: int = 8) -> list[dict]:
     for option_state in (state.get("option_states") or {}).values():
         for item in option_state.get("evidence") or []:
             evidence.append(item)
-    if not evidence:
-        for item in state.get("reasoning_memory_slots") or []:
-            evidence.append({"evidence_id": "", "doc_id": "", "text": str(item)})
     seen: set[str] = set()
     rows: list[dict] = []
     for item in evidence:
@@ -234,9 +231,13 @@ def evidence_summary_from_state(state: dict, max_items: int = 8) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
+        doc_id = str(item.get("doc_id") or "")
+        if not doc_id and evidence_id:
+            doc_id = evidence_id.split("_", 1)[0]
         rows.append(
             {
-                "doc_id": item.get("doc_id", ""),
+                "doc_id": doc_id,
+                "page_id": str(item.get("page_id") or evidence_id),
                 "evidence_id": evidence_id,
                 "heading": " > ".join(item.get("heading_path") or []),
                 "quote": compact_text(str(item.get("text") or ""))[:600],
@@ -246,6 +247,40 @@ def evidence_summary_from_state(state: dict, max_items: int = 8) -> list[dict]:
         if len(rows) >= max_items:
             break
     return rows
+
+
+def _reasoning_facts_from_state(state: dict) -> list[dict]:
+    facts: list[dict] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for item in state.get("reasoning_memory_slots") or []:
+        if not isinstance(item, dict):
+            continue
+        slot = str(item.get("slot") or "").strip()
+        value = str(item.get("value") or "").strip()
+        evidence_ids = [str(value) for value in item.get("evidence_ids") or [] if value]
+        if not slot or not value:
+            continue
+        key = (slot, value, tuple(evidence_ids))
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(
+            {
+                "slot": slot,
+                "value": value,
+                "evidence_ids": evidence_ids[:6],
+                "source": "user_query" if "题干" in evidence_ids else "document",
+            }
+        )
+    return facts
+
+
+def facts_summary_from_state(state: dict, max_items: int = 8) -> list[dict]:
+    return [item for item in _reasoning_facts_from_state(state) if item["source"] == "document"][:max_items]
+
+
+def question_info_summary_from_state(state: dict, max_items: int = 8) -> list[dict]:
+    return [item for item in _reasoning_facts_from_state(state) if item["source"] == "user_query"][:max_items]
 
 
 def enterprise_reason_from_state(state: dict) -> str:
@@ -276,6 +311,8 @@ def write_enterprise_result(state: dict, result_jsonl: str) -> dict:
         "answer": enterprise_answer_from_state(state),
         "raw_final_answer": state.get("final_answer", ""),
         "evidence": evidence_summary_from_state(state),
+        "facts": facts_summary_from_state(state),
+        "question_info": question_info_summary_from_state(state),
         "reason": enterprise_reason_from_state(state),
         "token_usage": state.get("token_usage", {}),
     }

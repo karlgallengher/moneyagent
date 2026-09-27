@@ -19,6 +19,9 @@ processed/
 public_dataset_upload/
 enterprise_qa_agent/outputs/
 enterprise_qa_agent/data/atomic_questions/
+web/dist/
+web/node_modules/
+web/tsconfig.tsbuildinfo
 *.log
 
 # OS / editor

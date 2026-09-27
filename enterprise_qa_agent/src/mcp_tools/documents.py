@@ -9,6 +9,7 @@ from typing import Any
 
 from enterprise_qa_agent.src.core.retrieval_core import BM25, tokenize
 from enterprise_qa_agent.src.core.text_utils import maybe_fix_mojibake
+from enterprise_qa_agent.src.chat.domain_registry import domain_index_dirs, load_domains, UPLOAD_ROOT
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +25,8 @@ DOMAIN_INDEX_DIRS = {
 
 def _resolve_domain(domain: str) -> str:
     domain = str(domain or "").strip()
+    DOMAIN_INDEX_DIRS.clear()
+    DOMAIN_INDEX_DIRS.update(domain_index_dirs())
     if domain not in DOMAIN_INDEX_DIRS:
         raise ValueError(f"domain must be one of {sorted(DOMAIN_INDEX_DIRS)}")
     return domain
@@ -159,14 +162,19 @@ def search_docs(query: str, domain: str, top_k: int = 5) -> dict[str, Any]:
 
 
 def list_domains() -> dict[str, Any]:
+    DOMAIN_INDEX_DIRS.clear()
+    DOMAIN_INDEX_DIRS.update(domain_index_dirs())
+    custom = load_domains()
     results = []
     for domain, relative_dir in DOMAIN_INDEX_DIRS.items():
         domain_dir = REPO_ROOT / relative_dir
         catalog_rows = _catalog(domain)
         page_rows = _pages(domain)
+        upload_path = UPLOAD_ROOT / domain
         results.append(
             {
                 "domain": domain,
+                "name": custom.get(domain, {}).get("name", domain),
                 "index_dir": relative_dir,
                 "catalog_path": str(domain_dir / "doc_catalog.jsonl"),
                 "page_index_path": str(domain_dir / "page_index.jsonl"),
@@ -174,8 +182,26 @@ def list_domains() -> dict[str, Any]:
                 "page_index_exists": (domain_dir / "page_index.jsonl").exists(),
                 "doc_count": len(catalog_rows),
                 "page_count": len(page_rows),
+                "upload_count": len(list(upload_path.glob("*.md"))) + len(list(upload_path.glob("*.txt"))) if domain in custom else 0,
+                "status": custom.get(domain, {}).get("status", "ready"),
+                "last_built_at": custom.get(domain, {}).get("last_built_at", ""),
             }
         )
+    for domain, item in custom.items():
+        if domain not in DOMAIN_INDEX_DIRS:
+            upload_path = UPLOAD_ROOT / domain
+            results.append({
+                "domain": domain,
+                "name": item.get("name", domain),
+                "index_dir": "",
+                "catalog_exists": False,
+                "page_index_exists": False,
+                "doc_count": 0,
+                "page_count": 0,
+                "upload_count": len(list(upload_path.glob("*.md"))) + len(list(upload_path.glob("*.txt"))),
+                "status": item.get("status", "needs_build"),
+                "last_built_at": item.get("last_built_at", ""),
+            })
     return {"domains": results}
 
 
