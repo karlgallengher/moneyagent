@@ -1,27 +1,28 @@
 import {
   AlertCircle,
+  ArrowUpRight,
   Bot,
-  CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Database,
   FileUp,
   FileText,
   FolderPlus,
   Loader2,
-  MessageSquareText,
+  LogOut,
+  Menu,
   Pencil,
   Plus,
   RefreshCcw,
-  Search,
   Send,
-  Server,
-  ShieldCheck,
+  Sparkles,
   Trash2,
-  User
+  X
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   askMoneyAgent,
+  ApiError,
   buildDomain,
   ChatResponse,
   createDomain,
@@ -33,9 +34,12 @@ import {
   DomainInfo,
   Evidence,
   fetchDomainFiles,
+  fetchCurrentUser,
   fetchDomains,
   fetchSession,
   fetchSessions,
+  login,
+  logout,
   renameSession,
   replaceDomainFile,
   SessionInfo,
@@ -53,9 +57,9 @@ type Message = {
 };
 
 const EXAMPLE_QUESTIONS = [
-  "请比较平安e生保和太保团体百万医疗的免赔额规则。",
-  "东方甄选相关研报中，GMV 和自营产品表现有什么变化？",
-  "请根据金融合同说明债券应计利息的计算逻辑。"
+  { label: "保险条款", question: "请比较平安e生保和太保团体百万医疗的免赔额规则。" },
+  { label: "研究报告", question: "东方甄选相关研报中，GMV 和自营产品表现有什么变化？" },
+  { label: "金融合同", question: "请根据金融合同说明债券应计利息的计算逻辑。" }
 ];
 
 const DOMAIN_LABELS: Record<string, string> = {
@@ -78,28 +82,16 @@ function domainLabel(domain: DomainInfo) {
   return DOMAIN_LABELS[domain.domain] || domain.name || domain.domain;
 }
 
-function StatusBadge({ ok, children }: { ok: boolean; children: ReactNode }) {
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs font-medium",
-        ok
-          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-          : "border-destructive/20 bg-destructive/10 text-destructive"
-      )}
-    >
-      {ok ? <CheckCircle2 className="h-3 w-3" /> : <AlertCircle className="h-3 w-3" />}
-      {children}
-    </span>
-  );
-}
-
 function Sidebar({
+  username,
+  onLogout,
   domains,
   selectedDomain,
   onDomainChange,
   loading,
   onReload,
+  mobileOpen,
+  onClose,
   sessions,
   activeSessionId,
   sessionsLoading,
@@ -111,11 +103,15 @@ function Sidebar({
   onDomainsChanged,
   onDomainRemoved
 }: {
+  username: string;
+  onLogout: () => void;
   domains: DomainInfo[];
   selectedDomain: string;
   onDomainChange: (domain: string) => void;
   loading: boolean;
   onReload: () => void;
+  mobileOpen: boolean;
+  onClose: () => void;
   sessions: SessionInfo[];
   activeSessionId: string;
   sessionsLoading: boolean;
@@ -142,6 +138,15 @@ function Sidebar({
     ? managedDomain
     : customDomains[0]?.domain || "";
   const targetInfo = customDomains.find((domain) => domain.domain === targetDomain);
+
+  useEffect(() => {
+    if (!showManager) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setShowManager(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showManager]);
 
   useEffect(() => {
     if (!showManager || !targetDomain) {
@@ -284,70 +289,75 @@ function Sidebar({
   }
 
   return (
-    <aside className="border-b bg-card lg:h-screen lg:min-h-0 lg:w-80 lg:shrink-0 lg:overflow-y-auto lg:border-b-0 lg:border-r">
-      <div className="flex min-h-full flex-col gap-5 p-4 lg:p-5">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2 text-sm font-semibold">
-              <ShieldCheck className="h-4 w-4" />
-              MoneyAgent
-            </div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">金融文档问答工作台</p>
+    <aside className={cn(
+      "workspace-sidebar fixed inset-y-0 left-0 z-40 flex w-[min(18rem,calc(100vw-3rem))] flex-col shadow-xl lg:relative lg:z-auto lg:h-screen lg:w-[268px] lg:shrink-0 lg:shadow-none",
+      !mobileOpen && "hidden lg:flex"
+    )}>
+      <div className="flex h-[76px] shrink-0 items-center justify-between border-b border-white/10 px-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="brand-mark" aria-hidden="true">
+            M<span>.</span>
+          </span>
+          <div className="min-w-0">
+            <div className="text-[15px] font-semibold leading-5 text-white">MoneyAgent</div>
+            <div className="mt-0.5 text-[11px] text-white/45">RESEARCH WORKSPACE</div>
           </div>
-          <button
-            type="button"
-            onClick={onReload}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md border bg-background text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label="刷新索引状态"
-          >
-            <RefreshCcw className={cn("h-4 w-4", loading && "animate-spin")} />
+        </div>
+        <button type="button" onClick={onClose} aria-label="关闭会话列表" title="关闭会话列表"
+          className="sidebar-icon-button lg:hidden"><X className="h-4 w-4" /></button>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="px-4 pt-5">
+          <button type="button" onClick={onCreateSession} disabled={disabled}
+            className="sidebar-new-button">
+            <Plus className="h-4 w-4" /> 新建研究
           </button>
         </div>
-
-        <section className="shrink-0 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-medium">对话</h2>
+        <section className="flex min-h-0 flex-1 flex-col px-3 pt-7">
+          <div className="mb-3 flex items-center justify-between px-3">
+            <h2 className="sidebar-label">对话记录</h2>
             <button
               type="button"
               onClick={onCreateSession}
               disabled={disabled}
-              className="inline-flex h-7 items-center gap-1 rounded-md border bg-background px-2 text-xs font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+              className="sidebar-icon-button"
+              aria-label="新建会话"
+              title="新建会话"
             >
-              <Plus className="h-3.5 w-3.5" />
-              新建
+              <Plus className="h-4 w-4" />
             </button>
           </div>
-          <div className="max-h-64 space-y-1 overflow-y-auto pr-1 lg:max-h-[34vh]">
+          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-3">
             {sessionsLoading && sessions.length === 0 ? (
               Array.from({ length: 3 }).map((_, index) => (
-                <div key={index} className="h-14 animate-pulse rounded-md border bg-muted/50" />
+                <div key={index} className="mx-1 mb-2 h-12 animate-pulse rounded-md bg-white/10" />
               ))
             ) : sessions.length === 0 ? (
-              <p className="rounded-md border border-dashed p-3 text-xs leading-5 text-muted-foreground">暂无会话，点击“新建”开始。</p>
+              <div className="px-3 py-6 text-xs text-white/50">暂无会话，开始一项新的研究。</div>
             ) : (
               sessions.map((session) => (
                 <div
                   key={session.session_id}
                   className={cn(
-                    "group flex items-center gap-1 rounded-md border p-1 transition-colors hover:bg-muted/50",
-                    activeSessionId === session.session_id && "border-foreground bg-muted"
+                    "sidebar-session group flex items-center gap-1 rounded-md border-l-2 border-transparent px-1 py-1 transition-colors",
+                    activeSessionId === session.session_id && "sidebar-session-active"
                   )}
                 >
                   <button
                     type="button"
                     onClick={() => onSelectSession(session.session_id)}
                     disabled={disabled}
-                    className="min-w-0 flex-1 rounded-sm px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed"
+                    className="min-w-0 flex-1 rounded-sm px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 disabled:cursor-not-allowed"
                   >
-                    <div className="truncate text-xs font-medium">{session.title || "新会话"}</div>
-                    <div className="mt-1 text-[11px] text-muted-foreground">{session.turn_count} 轮对话</div>
+                    <div className="truncate text-[13px] font-medium text-white/90">{session.title || "新会话"}</div>
+                    <div className="mt-1 text-[11px] text-white/45">{session.turn_count} 轮对话</div>
                   </button>
-                  <div className="flex shrink-0 opacity-100 lg:opacity-0 lg:group-hover:opacity-100">
+                  <div className="flex shrink-0 lg:opacity-0 lg:group-hover:opacity-100 lg:group-focus-within:opacity-100">
                     <button
                       type="button"
                       onClick={() => onRenameSession(session)}
                       disabled={disabled}
-                      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                      className="sidebar-icon-button h-7 w-7"
                       aria-label={`重命名 ${session.title || "会话"}`}
                       title="重命名"
                     >
@@ -357,7 +367,7 @@ function Sidebar({
                       type="button"
                       onClick={() => onDeleteSession(session)}
                       disabled={disabled}
-                      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                      className="sidebar-icon-button h-7 w-7 hover:!text-rose-300"
                       aria-label={`删除 ${session.title || "会话"}`}
                       title="删除"
                     >
@@ -370,72 +380,64 @@ function Sidebar({
           </div>
         </section>
 
-        <section className="space-y-2">
-          <label htmlFor="domain" className="text-sm font-medium">
-            知识域
-          </label>
-          <div className="relative">
-            <select
-              id="domain"
-              value={selectedDomain}
-              onChange={(event) => onDomainChange(event.target.value)}
-              className="h-9 w-full appearance-none rounded-md border bg-background px-3 pr-9 text-sm outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <option value="">自动识别</option>
-              {domains.filter((domain) => domain.page_index_exists).map((domain) => (
-                <option key={domain.domain} value={domain.domain}>
-                  {domainLabel(domain)}
-                </option>
-              ))}
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-          </div>
-          <p className="text-xs leading-5 text-muted-foreground">自动识别会先做跨域目录检索，再选择对应 page index。</p>
-        </section>
-
-        <section className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-medium">索引状态</h2>
+        <section className="shrink-0 border-t border-white/10 px-3 py-4">
+          <div className="mb-2 flex items-center justify-between px-3">
+            <h2 className="sidebar-label">研究资料</h2>
             <button
               type="button"
               onClick={() => setShowManager((value) => !value)}
               aria-expanded={showManager}
-              className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="sidebar-icon-button"
+              aria-label="管理知识域"
+              title="管理知识域"
             >
-              <FolderPlus className="h-3.5 w-3.5" />
-              管理领域
+              <FolderPlus className="h-4 w-4" />
             </button>
           </div>
           {showManager && (
-            <div className="space-y-3 border-y py-3 text-xs">
-              <form onSubmit={(event) => void create(event)} className="space-y-2">
-                <div className="text-sm font-medium">创建领域</div>
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45 p-3 sm:p-6" onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setShowManager(false);
+            }}>
+              <div role="dialog" aria-modal="true" aria-labelledby="domain-manager-title"
+                className="flex max-h-[min(90dvh,780px)] w-full max-w-3xl flex-col overflow-hidden rounded-lg border bg-card text-foreground shadow-xl">
+                <div className="flex shrink-0 items-center justify-between border-b px-5 py-4">
+                  <div>
+                    <h2 id="domain-manager-title" className="text-base font-semibold">管理知识域</h2>
+                    <p className="mt-1 text-xs text-muted-foreground">上传文档并构建检索索引</p>
+                  </div>
+                  <button type="button" onClick={() => setShowManager(false)} className="icon-button"
+                    aria-label="关闭知识域管理" title="关闭知识域管理"><X className="h-4 w-4" /></button>
+                </div>
+                <div className="min-h-0 overflow-y-auto p-5">
+                  <div className="grid gap-7 md:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]">
+              <form onSubmit={(event) => void create(event)} className="space-y-3 text-xs">
+                <div className="text-sm font-semibold">创建领域</div>
                 <label htmlFor="domain-name" className="block text-muted-foreground">领域名称</label>
                 <input id="domain-name" value={domainName} onChange={(event) => setDomainName(event.target.value)}
                   maxLength={60} required placeholder="例如：新能源行业"
-                  className="h-9 w-full rounded-md border bg-background px-2 outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+                  className="field" />
                 <label htmlFor="domain-key" className="block text-muted-foreground">领域标识（英文）</label>
                 <input id="domain-key" value={domainKey} onChange={(event) => setDomainKey(event.target.value)}
                   required pattern="[a-z][a-z0-9_-]{2,39}" placeholder="例如：new_energy"
-                  className="h-9 w-full rounded-md border bg-background px-2 outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+                  className="field" />
                 <label htmlFor="split-mode" className="block text-muted-foreground">切分方式</label>
                 <select id="split-mode" value={splitMode} onChange={(event) => setSplitMode(event.target.value)}
-                  className="h-9 w-full rounded-md border bg-background px-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  className="field">
                   <option value="heading">Markdown 标题</option>
                   <option value="heading_plus_numbered">标题与编号条款</option>
                   <option value="block">段落</option>
                 </select>
                 <button type="submit" disabled={!!domainBusy || disabled}
-                  className="h-8 rounded-md border px-3 font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+                  className="secondary-button">
                   创建
                 </button>
               </form>
               {customDomains.length > 0 && (
-                <>
-                  <div className="border-t pt-3 text-sm font-medium">上传与构建</div>
+                <div className="space-y-3 border-t pt-5 text-xs md:border-l md:border-t-0 md:pl-7 md:pt-0">
+                  <div className="text-sm font-semibold">上传与构建</div>
                   <label htmlFor="managed-domain" className="block text-muted-foreground">目标领域</label>
                   <select id="managed-domain" value={targetDomain} onChange={(event) => setManagedDomain(event.target.value)}
-                    className="h-9 w-full rounded-md border bg-background px-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                    className="field">
                     {customDomains.map((domain) => (
                       <option key={domain.domain} value={domain.domain}>{domainLabel(domain)}</option>
                     ))}
@@ -443,15 +445,15 @@ function Sidebar({
                   <form onSubmit={(event) => void upload(event)} className="space-y-2">
                     <label htmlFor="domain-files" className="block text-muted-foreground">UTF-8 Markdown 或文本文件（每个不超过 8 MB）</label>
                     <input id="domain-files" name="domain-files" type="file" accept=".md,.txt" multiple required
-                      className="block w-full text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1.5 file:text-xs" />
+                      className="block w-full min-w-0 text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1.5 file:text-xs" />
                     <div className="flex items-center gap-2">
                       <button type="submit" disabled={!!domainBusy || disabled}
-                        className="h-8 rounded-md border px-3 font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+                        className="secondary-button">
                         上传
                       </button>
                       <button type="button" onClick={() => void build()}
                         disabled={!!domainBusy || disabled || !(customDomains.find((domain) => domain.domain === targetDomain)?.upload_count)}
-                        className="h-8 rounded-md bg-primary px-3 font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+                        className="primary-button">
                         构建索引
                       </button>
                     </div>
@@ -512,20 +514,23 @@ function Sidebar({
                     )}
                   </div>
                   <button type="button" onClick={() => void removeDomain()} disabled={!!domainBusy || disabled}
-                    className="h-8 rounded-md border border-destructive/30 px-3 text-destructive hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+                    className="secondary-button border-destructive/30 text-destructive hover:bg-destructive/10">
                     删除领域
                   </button>
-                </>
+                </div>
               )}
+                  </div>
               {domainBusy && <div role="status" className="text-muted-foreground">{domainBusy}，请稍候…</div>}
               {domainError && <div role="alert" className="text-destructive">{domainError}</div>}
               {domainNotice && <div role="status" className="text-muted-foreground">{domainNotice}</div>}
+                </div>
+              </div>
             </div>
           )}
-          <div className="space-y-2">
+          <div className="max-h-[32vh] space-y-0.5 overflow-y-auto lg:max-h-[37vh]">
             {loading && domains.length === 0
-              ? Array.from({ length: 5 }).map((_, index) => (
-                  <div key={index} className="h-16 animate-pulse rounded-lg border bg-muted/50" />
+              ? Array.from({ length: 3 }).map((_, index) => (
+                  <div key={index} className="h-10 animate-pulse rounded-md bg-white/10" />
                 ))
               : domains.map((domain) => (
                   <button
@@ -534,62 +539,60 @@ function Sidebar({
                     onClick={() => onDomainChange(domain.page_index_exists ? domain.domain : selectedDomain)}
                     disabled={!domain.page_index_exists}
                     className={cn(
-                      "w-full rounded-lg border p-3 text-left text-sm transition hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60",
-                      selectedDomain === domain.domain && "border-foreground bg-muted"
+                      "sidebar-domain flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 disabled:cursor-not-allowed disabled:opacity-50",
+                      selectedDomain === domain.domain && "sidebar-domain-active font-medium"
                     )}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate font-medium">{domainLabel(domain)}</span>
-                      <StatusBadge ok={domain.catalog_exists && domain.page_index_exists}>
-                        {domain.status === "needs_build" ? "待重建" : domain.page_index_exists ? "ready" : "待构建"}
-                      </StatusBadge>
-                    </div>
-                    <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-muted-foreground">
-                      <span>{formatNumber(domain.doc_count)} 文档</span>
-                      <span>{domain.page_index_exists ? `${formatNumber(domain.page_count)} 页面` : `${formatNumber(domain.upload_count)} 待构建文件`}</span>
-                    </div>
+                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", domain.status === "needs_build" ? "bg-amber-500" : domain.page_index_exists ? "bg-emerald-600" : "bg-muted-foreground/50")} />
+                    <span className="min-w-0 flex-1 truncate text-white/80" title={domainLabel(domain)}>{domainLabel(domain)}</span>
+                    <span className="shrink-0 text-[11px] font-normal text-white/45">
+                      {domain.status === "needs_build" ? "待重建" : domain.page_index_exists ? `${formatNumber(domain.doc_count)} 文档` : "待构建"}
+                    </span>
                   </button>
                 ))}
           </div>
         </section>
-
-        <section className="mt-auto rounded-lg border bg-muted/40 p-3">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <Server className="h-4 w-4" />
-            API
-          </div>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">后端默认代理到 127.0.0.1:8000，前端开发端口为 5173。</p>
-        </section>
+        <div className="flex shrink-0 items-center justify-between border-t border-white/10 px-5 py-3 text-xs text-white/70">
+          <span className="min-w-0 truncate" title={username}>{username}</span>
+          <button type="button" onClick={onLogout} className="sidebar-icon-button" aria-label="退出登录" title="退出登录">
+            <LogOut className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={onReload} className="sidebar-icon-button" aria-label="刷新知识域" title="刷新知识域">
+            <RefreshCcw className={cn("h-4 w-4", loading && "animate-spin")} />
+          </button>
+        </div>
       </div>
     </aside>
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({ message, onShowEvidence }: { message: Message; onShowEvidence: (response: ChatResponse) => void }) {
   const isAssistant = message.role === "assistant";
   return (
-    <article className={cn("flex gap-3", isAssistant ? "items-start" : "items-start justify-end")}>
-      {isAssistant && (
-        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-muted">
-          <Bot className="h-4 w-4" />
+    <article className={cn("research-turn flex min-w-0 gap-4 py-7 sm:gap-6", isAssistant ? "research-turn-answer" : "research-turn-query")}>
+      <div className={cn("turn-index mt-0.5 shrink-0", isAssistant ? "turn-index-agent" : "turn-index-user")}>
+        {isAssistant ? <Sparkles className="h-[18px] w-[18px]" /> : <span className="font-mono text-xs">Q</span>}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="mb-3 flex items-center gap-3">
+          <span className="text-xs font-semibold">{isAssistant ? "研究结论" : "研究问题"}</span>
+          {isAssistant && <span className="h-px w-7 bg-primary/50" />}
         </div>
-      )}
-      <div className={cn("max-w-[860px] rounded-lg border px-4 py-3", isAssistant ? "bg-card" : "bg-foreground text-background")}>
-        <div className="whitespace-pre-wrap text-sm leading-6">{message.content}</div>
-        {message.error && <p className="mt-2 text-xs text-destructive">{message.error}</p>}
+        <div className={cn("whitespace-pre-wrap break-words text-[14px] leading-[1.9]", isAssistant ? "text-foreground" : "font-medium text-foreground")}>{message.content}</div>
+        {message.error && <p role="alert" className="mt-2 text-xs text-destructive">{message.error}</p>}
         {message.meta && (
-          <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
-            <span>domain: {message.meta.domain || "auto"}</span>
-            <span>docs: {message.meta.doc_ids.join(", ") || "-"}</span>
-            <span>tokens: {message.meta.token_usage.total_tokens}</span>
+          <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t pt-4 text-xs text-muted-foreground">
+            <span>范围 / {message.meta.domain || "自动识别"}</span>
+            <span>引用 / {message.meta.doc_ids.length} 份文档</span>
+            <button type="button" onClick={() => {
+              if (message.meta) onShowEvidence(message.meta);
+            }}
+              className="ml-auto inline-flex items-center gap-1 font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              查看来源 <ArrowUpRight className="h-3.5 w-3.5" />
+            </button>
           </div>
         )}
       </div>
-      {!isAssistant && (
-        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-card">
-          <User className="h-4 w-4" />
-        </div>
-      )}
     </article>
   );
 }
@@ -611,8 +614,9 @@ function Composer({
   }
 
   return (
-    <form onSubmit={submit} className="border-t bg-background p-4">
-      <div className="rounded-lg border bg-card p-2">
+    <form onSubmit={submit} className="composer-region shrink-0 border-t px-4 py-3 sm:px-8 sm:py-5">
+      <div className="mx-auto max-w-[780px]">
+        <div className="composer-box">
         <label htmlFor="query" className="sr-only">
           输入金融问题
         </label>
@@ -620,53 +624,48 @@ function Composer({
           id="query"
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          rows={3}
-          placeholder="输入金融文档问题，例如：请比较两个保险产品的免赔额规则"
-          className="min-h-20 w-full resize-none bg-transparent px-2 py-2 text-sm leading-6 outline-none placeholder:text-muted-foreground"
+          rows={2}
+          placeholder="输入你的研究问题…"
+          className="max-h-44 min-h-16 w-full resize-y bg-transparent px-1 py-1 text-sm leading-6 outline-none placeholder:text-muted-foreground"
           disabled={loading}
         />
-        <div className="flex flex-col gap-2 border-t pt-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex flex-wrap gap-2">
-            {EXAMPLE_QUESTIONS.map((question) => (
-              <button
-                key={question}
-                type="button"
-                onClick={() => onChange(question)}
-                className="rounded-md border px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {question.length > 18 ? `${question.slice(0, 18)}...` : question}
-              </button>
-            ))}
-          </div>
+        <div className="flex items-center justify-between border-t pt-2">
+          <span className="hidden text-xs text-muted-foreground sm:inline">基于知识库检索 · 支持连续追问</span>
           <button
             type="submit"
             disabled={loading || !value.trim()}
-            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
+            className="send-button"
           >
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             发送
           </button>
+        </div>
         </div>
       </div>
     </form>
   );
 }
 
-function EvidencePanel({ activeResponse, loading }: { activeResponse: ChatResponse | null; loading: boolean }) {
+function EvidencePanel({ activeResponse, loading, open, onClose }: { activeResponse: ChatResponse | null; loading: boolean; open: boolean; onClose: () => void }) {
   const evidence = activeResponse?.evidence || [];
   const facts = activeResponse?.facts || [];
   const questionInfo = activeResponse?.question_info || [];
   return (
-    <aside className="max-h-[65vh] min-h-0 border-t bg-card lg:h-screen lg:max-h-none lg:w-96 lg:border-l lg:border-t-0">
+    <aside className={cn(
+      "evidence-panel fixed inset-y-0 right-0 z-40 w-[min(25rem,100vw)] border-l shadow-xl lg:relative lg:z-auto lg:h-screen lg:w-80 lg:shrink-0 lg:shadow-none xl:w-[23rem]",
+      !open && "hidden"
+    )}>
       <div className="flex h-full min-h-0 flex-col">
-        <div className="border-b p-4">
-          <div className="flex items-center gap-2 text-sm font-semibold">
-            <FileText className="h-4 w-4" />
-            证据与调试
+        <div className="flex h-[76px] shrink-0 items-center justify-between border-b px-5">
+          <div>
+            <div className="text-sm font-semibold">资料来源</div>
+            <p className="mt-1 text-xs text-muted-foreground">SOURCE INSPECTOR</p>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">展示 Agent 返回的证据、文档命中和 token 使用。</p>
+          <button type="button" onClick={onClose} className="icon-button" aria-label="关闭证据" title="关闭证据">
+            <X className="h-4 w-4" />
+          </button>
         </div>
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-5">
           {loading && (
             <div className="space-y-2">
               <div className="h-20 animate-pulse rounded-lg border bg-muted/50" />
@@ -674,37 +673,37 @@ function EvidencePanel({ activeResponse, loading }: { activeResponse: ChatRespon
             </div>
           )}
           {!loading && !activeResponse && (
-            <div className="rounded-lg border border-dashed p-4 text-sm">
-              <div className="font-medium">暂无证据</div>
-              <p className="mt-1 leading-5 text-muted-foreground">发送一个问题后，这里会显示命中文档、证据片段和运行信息。</p>
+            <div className="border-l-2 border-primary/30 pl-3 text-sm">
+              <div className="font-medium">暂无可展示的来源</div>
+              <p className="mt-1 leading-5 text-muted-foreground">新一轮问答完成后可查看引用；历史会话暂不恢复旧证据。</p>
             </div>
           )}
           {activeResponse && (
             <>
-              <div className="grid grid-cols-2 gap-2 text-sm">
-                <div className="rounded-lg border p-3">
-                  <div className="text-xs text-muted-foreground">Domain</div>
-                  <div className="mt-1 truncate font-medium">{activeResponse.domain || "auto"}</div>
+              <div className="grid grid-cols-2 gap-3 border-b pb-5 text-sm">
+                <div className="min-w-0">
+                  <div className="text-xs text-muted-foreground">知识域</div>
+                  <div className="mt-1 truncate font-medium">{activeResponse.domain || "自动识别"}</div>
                 </div>
-                <div className="rounded-lg border p-3">
-                  <div className="text-xs text-muted-foreground">Token</div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Token 使用</div>
                   <div className="mt-1 font-medium">{formatNumber(activeResponse.token_usage.total_tokens)}</div>
                 </div>
               </div>
               <EvidenceList evidence={evidence} facts={facts} questionInfo={questionInfo} />
-              <div className="rounded-lg border p-3 text-xs">
-                <div className="mb-2 flex items-center gap-2 font-medium">
+              <details className="border-t pt-4 text-xs">
+                <summary className="flex cursor-pointer items-center gap-2 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                   <Database className="h-3.5 w-3.5" />
-                  Debug files
-                </div>
-                <div className="space-y-1 text-muted-foreground">
+                  调试文件
+                </summary>
+                <div className="mt-3 space-y-1 break-all text-muted-foreground">
                   {Object.entries(activeResponse.debug_files || {}).map(([key, value]) => (
-                    <div key={key} className="truncate">
+                    <div key={key}>
                       {key}: {value}
                     </div>
                   ))}
                 </div>
-              </div>
+              </details>
             </>
           )}
         </div>
@@ -724,7 +723,7 @@ function EvidenceList({
 }) {
   if (!evidence.length && !facts.length && !questionInfo.length) {
     return (
-      <div className="rounded-lg border border-dashed p-4 text-sm">
+      <div className="border-l-2 border-border pl-3 text-sm">
         <div className="font-medium">没有返回证据片段</div>
         <p className="mt-1 text-muted-foreground">可能是问答失败、证据为空，或当前输出没有包含 evidence summary。</p>
       </div>
@@ -732,29 +731,30 @@ function EvidenceList({
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       {evidence.length > 0 && (
         <section className="space-y-2">
-          <div className="text-sm font-medium">文档证据</div>
+          <div className="section-label">原文摘录 / {evidence.length}</div>
       {evidence.map((item, index) => (
-        <div key={`${item.doc_id}-${item.page_id}-${index}`} className="rounded-lg border p-3">
+        <div key={`${item.doc_id}-${item.page_id}-${index}`} className="source-item border-b py-4 last:border-0">
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span className="source-number">{String(index + 1).padStart(2, "0")}</span>
             <span>文档 {item.doc_id || "未知"}</span>
             <span>页面 {item.page_id || item.evidence_id || "未知"}</span>
           </div>
           {item.heading && <div className="mt-2 text-xs font-medium">{item.heading}</div>}
-          <p className="mt-2 line-clamp-6 whitespace-pre-wrap text-xs leading-5 text-muted-foreground">{item.quote || "无原文摘录"}</p>
+          <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{item.quote || "无原文摘录"}</p>
         </div>
       ))}
         </section>
       )}
       {facts.length > 0 && (
         <section className="space-y-2">
-          <div className="text-sm font-medium">回答要点</div>
+          <div className="section-label">回答要点 · {facts.length}</div>
           {facts.map((item, index) => (
-            <div key={`${item.slot}-${index}`} className="rounded-lg border p-3">
+            <div key={`${item.slot}-${index}`} className="border-b py-3 last:border-0">
               <div className="text-xs font-medium">{item.slot}</div>
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">{item.value}</p>
+              <p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{item.value}</p>
               <div className="mt-2 text-[11px] text-muted-foreground">
                 来源：{item.evidence_ids.length ? item.evidence_ids.join(", ") : "未标注"}
               </div>
@@ -764,11 +764,11 @@ function EvidenceList({
       )}
       {questionInfo.length > 0 && (
         <section className="space-y-2">
-          <div className="text-sm font-medium">问题中已知信息</div>
+          <div className="section-label">问题中已知信息 · {questionInfo.length}</div>
           {questionInfo.map((item, index) => (
-            <div key={`${item.slot}-${index}`} className="rounded-lg border border-dashed p-3">
+            <div key={`${item.slot}-${index}`} className="border-b py-3 last:border-0">
               <div className="text-xs font-medium">{item.slot}</div>
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">{item.value}</p>
+              <p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{item.value}</p>
               <div className="mt-2 text-[11px] text-muted-foreground">来源：用户问题</div>
             </div>
           ))}
@@ -778,7 +778,7 @@ function EvidenceList({
   );
 }
 
-export function App() {
+function Workspace({ username, onLogout }: { username: string; onLogout: () => Promise<void> }) {
   const [domains, setDomains] = useState<DomainInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -789,6 +789,10 @@ export function App() {
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadingAnswer, setLoadingAnswer] = useState(false);
   const [error, setError] = useState("");
+  const [logoutError, setLogoutError] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [inspectedResponse, setInspectedResponse] = useState<ChatResponse | null>(null);
   const initialized = useRef(false);
   const activeSession = sessions.find((session) => session.session_id === activeSessionId);
 
@@ -879,6 +883,8 @@ export function App() {
     setMessages([]);
     setQuery("");
     setError("");
+    setSidebarOpen(false);
+    setInspectedResponse(null);
     await loadSession(sessionId);
   }
 
@@ -891,6 +897,8 @@ export function App() {
       setQuery("");
       setError("");
       setSelectedDomain("");
+      setSidebarOpen(false);
+      setInspectedResponse(null);
       await refreshSessions();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "无法创建会话。");
@@ -936,6 +944,7 @@ export function App() {
     setMessages((current) => [...current, userMessage]);
     setQuery("");
     setLoadingAnswer(true);
+    setInspectedResponse(null);
     setError("");
     try {
       const response = await askMoneyAgent({
@@ -971,15 +980,33 @@ export function App() {
     }
   }
 
+  async function handleLogout() {
+    try {
+      setLogoutError("");
+      await onLogout();
+    } catch (caught) {
+      setLogoutError(caught instanceof Error ? caught.message : "退出失败，请重试");
+    }
+  }
+
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="flex min-h-screen flex-col lg:h-screen lg:overflow-hidden lg:flex-row">
+    <div className="workspace-shell h-dvh overflow-hidden text-foreground">
+      {(sidebarOpen || evidenceOpen) && (
+        <button type="button" className="fixed inset-0 z-30 bg-foreground/35 lg:hidden"
+          onClick={() => { setSidebarOpen(false); setEvidenceOpen(false); }}
+          aria-label="关闭侧边面板" />
+      )}
+      <div className="flex h-full min-h-0">
         <Sidebar
+          username={username}
+          onLogout={() => void handleLogout()}
           domains={domains}
           selectedDomain={selectedDomain}
           onDomainChange={setSelectedDomain}
           loading={loadingDomains}
           onReload={() => void loadDomains()}
+          mobileOpen={sidebarOpen}
+          onClose={() => setSidebarOpen(false)}
           sessions={sessions}
           activeSessionId={activeSessionId}
           sessionsLoading={loadingSessions}
@@ -991,76 +1018,111 @@ export function App() {
           onDomainsChanged={reloadDomains}
           onDomainRemoved={handleDomainRemoved}
         />
-        <main className="flex min-h-[720px] flex-1 flex-col lg:min-h-0">
-          <header className="border-b bg-card px-4 py-4 lg:px-6">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-                  <MessageSquareText className="h-5 w-5" />
-                  {activeSession?.title || "金融问答"}
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <header className="workspace-header shrink-0 px-4 sm:px-8">
+            <div className="flex h-[76px] items-center gap-3">
+              <button type="button" onClick={() => setSidebarOpen(true)} className="icon-button lg:hidden"
+                aria-label="打开会话列表" title="打开会话列表"><Menu className="h-5 w-5" /></button>
+              <div className="min-w-0 flex-1">
+                <div className="hidden items-center gap-2 text-[11px] text-muted-foreground sm:flex">
+                  <span className="header-path">研究工作台</span>
+                  <ChevronRight className="h-3 w-3" />
+                  <span>对话</span>
                 </div>
-                <p className="mt-1 text-sm text-muted-foreground">基于金融合同、财报、保险条款、监管文件与研报的检索增强问答。</p>
+                <h1 className="mt-0.5 truncate text-sm font-semibold sm:text-[16px]" title={activeSession?.title || "新研究"}>
+                  {activeSession?.title || "新研究"}
+                </h1>
               </div>
-              <div className="flex flex-wrap gap-2">
-                <StatusBadge ok={!error}>API {error ? "error" : "ready"}</StatusBadge>
-                <StatusBadge ok={domains.length > 0}>Index {domains.length || 0}</StatusBadge>
-                <button
-                  type="button"
-                  onClick={() => void createAndSelectSession()}
-                  disabled={loadingAnswer}
-                  className="inline-flex h-7 items-center gap-1 rounded-md border bg-background px-2 text-xs font-medium hover:bg-muted disabled:opacity-50"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  新会话
+              <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+                <div className="relative">
+                  <label htmlFor="domain" className="sr-only">检索知识域</label>
+                  <select id="domain" value={selectedDomain} onChange={(event) => setSelectedDomain(event.target.value)}
+                    className="domain-select h-9 max-w-[110px] appearance-none truncate rounded-md border pl-3 pr-7 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring sm:max-w-[168px] sm:text-sm">
+                    <option value="">全部领域</option>
+                    {domains.filter((domain) => domain.page_index_exists).map((domain) => (
+                      <option key={domain.domain} value={domain.domain}>{domainLabel(domain)}</option>
+                    ))}
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                </div>
+                <button type="button" onClick={() => void createAndSelectSession()} disabled={loadingAnswer}
+                  className="icon-button hidden sm:inline-flex" aria-label="新建会话" title="新建会话"><Plus className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setEvidenceOpen((value) => !value)}
+                  className={cn("inspector-toggle inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", evidenceOpen && "inspector-toggle-active")} aria-label={evidenceOpen ? "关闭证据" : "打开证据"}
+                  title={evidenceOpen ? "关闭证据" : "打开证据"} aria-expanded={evidenceOpen}>
+                  <FileText className="h-4 w-4" /><span className="hidden sm:inline">证据</span>
                 </button>
               </div>
             </div>
-            {error && (
-              <div className="mt-3 rounded-lg border border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">
-                {error}
+            {(error || logoutError) && (
+              <div role="alert" className="mb-3 flex items-start gap-2 rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error || logoutError}
               </div>
             )}
           </header>
 
-          <section className="min-h-0 flex-1 overflow-y-auto p-4 lg:p-6">
+          <section className="research-scroll min-h-0 flex-1 overflow-y-auto px-4 sm:px-8">
             {messages.length === 0 ? (
-              <div className="mx-auto flex min-h-[420px] max-w-3xl flex-col justify-center">
-                <div className="rounded-xl border bg-card p-5">
-                  <div className="flex items-center gap-2 text-base font-semibold">
-                    <Search className="h-4 w-4" />
-                    开始一次金融文档问答
+              <div className="mx-auto flex min-h-full max-w-[780px] flex-col justify-center py-8 sm:py-12">
+                <div className="empty-lead">
+                  <div className="flex items-center gap-3 text-xs font-semibold text-primary">
+                    <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+                    RESEARCH DESK
                   </div>
-                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                    选择一个知识域，或保持自动识别。提问后，右侧会展示命中文档、证据片段和 token 使用情况。
+                  <h2 className="mt-6 text-[28px] font-semibold leading-tight sm:text-[32px]">
+                    今天想研究什么？
+                  </h2>
+                  <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                    提出问题，沿着文档线索继续深入。
                   </p>
-                  <div className="mt-4 grid gap-2">
-                    {EXAMPLE_QUESTIONS.map((question) => (
+                  <div className="mt-6 flex flex-wrap gap-x-5 gap-y-2 text-xs text-muted-foreground">
+                    <span><strong className="mr-1 font-mono text-foreground">{domains.filter((domain) => domain.page_index_exists).length}</strong>个可用领域</span>
+                    <span><strong className="mr-1 font-mono text-foreground">{formatNumber(domains.reduce((total, domain) => total + (domain.page_index_exists ? domain.doc_count : 0), 0))}</strong>份已索引文档</span>
+                  </div>
+                </div>
+                <div className="mt-9 border-t border-foreground/15 pt-4 sm:mt-12">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="section-label">探索方向</h3>
+                    <span className="font-mono text-[11px] text-muted-foreground">01 — 03</span>
+                  </div>
+                  <div className="divide-y">
+                    {EXAMPLE_QUESTIONS.map(({ label, question }, index) => (
                       <button
                         key={question}
                         type="button"
                         onClick={() => setQuery(question)}
-                        className="rounded-lg border px-3 py-2 text-left text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        className="example-row group flex w-full items-start gap-3 py-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:items-center sm:gap-5"
                       >
-                        {question}
+                        <span className="w-6 shrink-0 pt-0.5 font-mono text-xs text-muted-foreground">{String(index + 1).padStart(2, "0")}</span>
+                        <span className="min-w-0 flex-1 text-[13px] leading-6 sm:text-sm">{question}</span>
+                        <span className="hidden shrink-0 text-[11px] text-muted-foreground md:inline">{label}</span>
+                        <ArrowUpRight className="mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-primary" />
                       </button>
                     ))}
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="space-y-4">
+              <div className="mx-auto max-w-[780px] pb-8 pt-4">
+                <div className="mb-2 flex items-center justify-between border-b pb-3 text-[11px] text-muted-foreground">
+                  <span className="font-semibold text-foreground">研究记录</span>
+                  <span className="font-mono">{Math.ceil(messages.length / 2).toString().padStart(2, "0")} 个问题</span>
+                </div>
                 {messages.map((message) => (
-                  <MessageBubble key={message.id} message={message} />
+                  <MessageBubble key={message.id} message={message} onShowEvidence={(response) => {
+                    setInspectedResponse(response);
+                    setEvidenceOpen(true);
+                  }} />
                 ))}
                 {loadingAnswer && (
-                  <article className="flex gap-3">
-                    <div className="mt-1 flex h-8 w-8 items-center justify-center rounded-md border bg-muted">
+                  <article role="status" className="flex gap-4 py-6">
+                    <div className="turn-index turn-index-agent shrink-0">
                       <Bot className="h-4 w-4" />
                     </div>
-                    <div className="w-full max-w-[860px] rounded-lg border bg-card px-4 py-3">
+                    <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        MoneyAgent 正在检索、规划并生成答案
+                        正在检索并整理答案
                       </div>
                       <div className="mt-3 space-y-2">
                         <div className="h-3 w-3/4 animate-pulse rounded bg-muted" />
@@ -1074,8 +1136,117 @@ export function App() {
           </section>
           <Composer value={query} onChange={setQuery} onSubmit={submit} loading={loadingAnswer} />
         </main>
-        <EvidencePanel activeResponse={activeResponse} loading={loadingAnswer} />
+        <EvidencePanel activeResponse={inspectedResponse || activeResponse} loading={loadingAnswer && !inspectedResponse}
+          open={evidenceOpen} onClose={() => setEvidenceOpen(false)} />
       </div>
     </div>
   );
+}
+
+function LoginView({ onLogin, initialError }: {
+  onLogin: (username: string, password: string) => Promise<void>;
+  initialError: string;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setSubmitting(true);
+    try {
+      await onLogin(username.trim(), password);
+      setPassword("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "登录失败，请稍后重试");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="auth-screen min-h-dvh">
+      <header className="flex h-[76px] items-center border-b px-5 sm:px-10">
+        <span className="auth-brand-mark" aria-hidden="true">M<span>.</span></span>
+        <span className="ml-3 text-sm font-semibold">MoneyAgent</span>
+        <span className="ml-auto text-xs text-muted-foreground">研究工作台</span>
+      </header>
+      <main className="mx-auto flex w-full max-w-[420px] flex-col px-6 pb-12 pt-[min(15vh,110px)] sm:px-4">
+        <div className="mb-7 border-l-[3px] border-[#be6546] pl-4">
+          <div className="text-xs font-medium text-primary">RESEARCH WORKSPACE</div>
+          <h1 className="mt-3 text-2xl font-semibold">欢迎回来</h1>
+          <p className="mt-2 text-sm text-muted-foreground">登录后继续你的研究。</p>
+        </div>
+        <form onSubmit={(event) => void submit(event)} className="space-y-5">
+          <div>
+            <label htmlFor="auth-username" className="mb-2 block text-sm font-medium">账号</label>
+            <input id="auth-username" name="username" autoComplete="username" required minLength={3}
+              value={username} onChange={(event) => setUsername(event.target.value)}
+              disabled={submitting} className="field h-11" />
+          </div>
+          <div>
+            <label htmlFor="auth-password" className="mb-2 block text-sm font-medium">密码</label>
+            <input id="auth-password" name="password" type="password" autoComplete="current-password" required
+              value={password} onChange={(event) => setPassword(event.target.value)}
+              disabled={submitting} className="field h-11" />
+          </div>
+          {(error || initialError) && (
+            <p role="alert" className="flex gap-2 text-sm text-destructive">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error || initialError}
+            </p>
+          )}
+          <button type="submit" disabled={submitting} className="send-button h-11 w-full">
+            {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+            {submitting ? "正在登录" : "登录"}
+          </button>
+        </form>
+        <p className="mt-6 text-xs text-muted-foreground">账号由管理员邀请开通。</p>
+      </main>
+    </div>
+  );
+}
+
+export function App() {
+  const [username, setUsername] = useState("");
+  const [checking, setChecking] = useState(true);
+  const [initialError, setInitialError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const onUnauthorized = () => {
+      if (active) {
+        setUsername("");
+        setInitialError("登录已过期，请重新登录");
+      }
+    };
+    window.addEventListener("moneyagent:unauthorized", onUnauthorized);
+    void fetchCurrentUser()
+      .then((user) => { if (active) { setUsername(user.username); setInitialError(""); } })
+      .catch((caught) => {
+        if (active && !(caught instanceof ApiError && caught.status === 401)) {
+          setInitialError("无法连接服务，请确认后端已启动");
+        }
+      })
+      .finally(() => { if (active) setChecking(false); });
+    return () => { active = false; window.removeEventListener("moneyagent:unauthorized", onUnauthorized); };
+  }, []);
+
+  if (checking) {
+    return <div role="status" className="flex min-h-dvh items-center justify-center gap-2 text-sm text-muted-foreground">
+      <Loader2 className="h-4 w-4 animate-spin" />正在验证登录
+    </div>;
+  }
+  if (!username) {
+    return <LoginView initialError={initialError} onLogin={async (name, password) => {
+      const user = await login(name, password);
+      setInitialError("");
+      setUsername(user.username);
+    }} />;
+  }
+  return <Workspace username={username} onLogout={async () => {
+    await logout();
+    setUsername("");
+  }} />;
 }

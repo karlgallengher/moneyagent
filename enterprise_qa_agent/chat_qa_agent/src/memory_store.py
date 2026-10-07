@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
 
 from .config import (
     COMPRESS_EVERY,
@@ -16,10 +18,18 @@ from .memory_policy import evidence_note_is_negative, infer_evidence_subject
 from .utils import json_dumps, json_loads, now_iso, safe_text
 
 
-def connect_db() -> sqlite3.Connection:
+@contextmanager
+def connect_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -84,6 +94,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "owner_id" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id)")
     conn.commit()
 
 
@@ -107,9 +121,10 @@ def ensure_session(conn: sqlite3.Connection, session_id: str) -> None:
     conn.commit()
 
 
-def list_sessions(conn: sqlite3.Connection) -> list[dict]:
+def list_sessions(conn: sqlite3.Connection, owner_id: str | None = None) -> list[dict]:
+    where = "WHERE s.owner_id = ?" if owner_id is not None else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT
             s.session_id,
             s.title,
@@ -120,9 +135,11 @@ def list_sessions(conn: sqlite3.Connection) -> list[dict]:
             MAX(t.created_at) AS last_turn_at
         FROM sessions s
         LEFT JOIN turns t ON t.session_id = s.session_id
+        {where}
         GROUP BY s.session_id
         ORDER BY s.updated_at DESC, s.created_at DESC
-        """
+        """,
+        (owner_id,) if owner_id is not None else (),
     ).fetchall()
     return [
         {

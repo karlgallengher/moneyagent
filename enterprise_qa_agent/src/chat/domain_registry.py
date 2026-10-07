@@ -6,15 +6,19 @@ import re
 import shutil
 import threading
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-REGISTRY_PATH = REPO_ROOT / "processed" / "user_domains.json"
-UPLOAD_ROOT = REPO_ROOT / "public_dataset_upload" / "raw_md"
-INDEX_ROOT = REPO_ROOT / "processed" / "user_page_indexes"
+DATA_ROOT = Path(os.environ.get("MONEYAGENT_DATA_ROOT", str(REPO_ROOT)))
+REGISTRY_PATH = DATA_ROOT / "processed" / "user_domains.json"
+UPLOAD_ROOT = DATA_ROOT / "public_dataset_upload" / "raw_md"
+INDEX_ROOT = DATA_ROOT / "processed" / "user_page_indexes"
 INDEX_LOCK = threading.RLock()
+_VISIBLE_DOMAINS: ContextVar[frozenset[str] | None] = ContextVar("visible_domains", default=None)
 
 BUILTIN_DOMAINS = {
     "financial_contracts": "processed/page_index_financial_contracts",
@@ -46,7 +50,32 @@ def save_domains(domains: dict[str, dict]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def create_domain(domain: str, name: str, split_mode: str = "heading") -> dict:
+@contextmanager
+def visible_domains(domains: set[str]):
+    token = _VISIBLE_DOMAINS.set(frozenset(domains))
+    try:
+        yield
+    finally:
+        _VISIBLE_DOMAINS.reset(token)
+
+
+def owned_domain_keys(user_id: str) -> set[str]:
+    return {
+        domain for domain, item in load_domains().items()
+        if item.get("owner_id") == user_id
+    }
+
+
+def claim_legacy_domains(user_id: str) -> None:
+    with INDEX_LOCK:
+        domains = load_domains()
+        for item in domains.values():
+            if not item.get("owner_id"):
+                item["owner_id"] = user_id
+        save_domains(domains)
+
+
+def create_domain(domain: str, name: str, split_mode: str = "heading", *, owner_id: str | None = None) -> dict:
     if not DOMAIN_RE.fullmatch(domain) or domain in BUILTIN_DOMAINS:
         raise ValueError("领域标识需为 3-40 位小写字母、数字、下划线或连字符，且不能与内置领域重名")
     name = name.strip()
@@ -63,6 +92,7 @@ def create_domain(domain: str, name: str, split_mode: str = "heading") -> dict:
             "split_mode": split_mode,
             "index_dir": "",
             "status": "needs_build",
+            "owner_id": owner_id,
         }
         save_domains(domains)
         return domains[domain]
@@ -76,13 +106,18 @@ def user_domain(domain: str) -> dict:
 
 
 def domain_index_dirs() -> dict[str, str]:
+    visible = _VISIBLE_DOMAINS.get()
     result = dict(BUILTIN_DOMAINS)
     for domain, item in load_domains().items():
+        if visible is not None and domain not in visible:
+            continue
         index_dir = str(item.get("index_dir") or "")
         if DOMAIN_RE.fullmatch(domain) and index_dir:
             path = (REPO_ROOT / index_dir).resolve()
+            if not Path(index_dir).is_absolute() and not path.exists():
+                path = (DATA_ROOT / index_dir).resolve()
             if path.is_relative_to(INDEX_ROOT.resolve()) and (path / "page_index.jsonl").exists():
-                result[domain] = index_dir
+                result[domain] = str(path) if not path.is_relative_to(REPO_ROOT) else index_dir
     return result
 
 
@@ -224,7 +259,10 @@ def build_domain(domain: str) -> dict:
         if not result["page_count"]:
             raise ValueError("文件未产生可检索内容，请检查文件格式和内容")
         domains = load_domains()
-        domains[domain]["index_dir"] = output.relative_to(REPO_ROOT).as_posix()
+        domains[domain]["index_dir"] = (
+            output.relative_to(REPO_ROOT).as_posix()
+            if output.is_relative_to(REPO_ROOT) else str(output.resolve())
+        )
         domains[domain]["status"] = "ready"
         domains[domain]["last_built_at"] = _now_iso()
         save_domains(domains)

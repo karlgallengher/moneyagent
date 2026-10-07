@@ -28,6 +28,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 os.chdir(REPO_ROOT)
 
-SESSION_DIR = REPO_ROOT / "enterprise_qa_agent" / "outputs" / "chat_sessions"
+SESSION_DIR = Path(os.environ.get(
+    "MONEYAGENT_STATE_DIR",
+    str(REPO_ROOT / "enterprise_qa_agent" / "outputs" / "chat_sessions"),
+))
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = SESSION_DIR / "chat_sessions.sqlite3"

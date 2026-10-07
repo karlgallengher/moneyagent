@@ -71,19 +71,59 @@ type ApiEnvelope<T> = {
   error: { type: string; message: string } | null;
 };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    headers: init?.body instanceof FormData ? undefined : { "Content-Type": "application/json" },
-    ...init
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+export type AuthInfo = { username: string; csrf_token: string };
+
+let csrfToken = "";
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
   }
-  const envelope = (await response.json()) as ApiEnvelope<T>;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (!(init?.body instanceof FormData)) headers.set("Content-Type", "application/json");
+  if (init?.method && !["GET", "HEAD"].includes(init.method.toUpperCase()) && path !== "/api/auth/login") {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  const response = await fetch(path, {
+    ...init,
+    headers,
+    credentials: "same-origin"
+  });
+  const envelope = (await response.json()) as ApiEnvelope<T> & { detail?: string };
+  if (!response.ok) {
+    if (response.status === 401 && path !== "/api/auth/login") {
+      csrfToken = "";
+      window.dispatchEvent(new Event("moneyagent:unauthorized"));
+    }
+    throw new ApiError(response.status, envelope.detail || envelope.error?.message || `HTTP ${response.status}`);
+  }
   if (!envelope.ok || !envelope.data) {
     throw new Error(envelope.error?.message || "MoneyAgent API returned an error.");
   }
   return envelope.data;
+}
+
+export async function fetchCurrentUser() {
+  const result = await request<AuthInfo>("/api/auth/me");
+  csrfToken = result.csrf_token;
+  return result;
+}
+
+export async function login(username: string, password: string) {
+  const result = await request<AuthInfo>("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password })
+  });
+  csrfToken = result.csrf_token;
+  return result;
+}
+
+export async function logout() {
+  await request<{ logged_out: boolean }>("/api/auth/logout", { method: "POST" });
+  csrfToken = "";
 }
 
 export function fetchDomains() {
